@@ -1,4 +1,4 @@
-from leopard_gecko.models.config import AppConfig
+from leopard_gecko.models.config import AppConfig, RouterBackend, WorkerBackend
 from leopard_gecko.models.session import Session, SessionsState
 from leopard_gecko.models.task import QueueStatus, RoutingDecision, Task
 
@@ -22,7 +22,20 @@ def test_config_defaults() -> None:
 
     assert config.max_terminal_num == 4
     assert config.queue_policy.max_queue_per_session == 5
+    assert config.router.backend is RouterBackend.AGENT
+    assert config.router.agent.model == "gpt-5-mini"
+    assert config.router.agent.api_key_env_var == "OPENAI_API_KEY"
+    assert config.worker.backend is WorkerBackend.NOOP
     assert config.data_dir == ".leopard-gecko"
+
+
+def test_agent_router_runtime_model_uses_openai_model_env(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5")
+
+    config = AppConfig.default(data_dir=".leopard-gecko")
+
+    assert config.router.agent.model == "gpt-5-mini"
+    assert config.router.agent.runtime_model == "gpt-5"
 
 
 def test_session_state_defaults() -> None:
@@ -32,4 +45,29 @@ def test_session_state_defaults() -> None:
     assert state.global_queue == []
     assert session.queue == []
     assert session.current_task_id is None
+    assert session.worker_backend is None
+    assert session.worker_context_id is None
+    assert session.active_run_id is None
+    assert session.active_pid is None
+    assert session.active_run_started_at is None
+    assert session.last_run_output_path is None
 
+
+def test_session_runtime_fields_round_trip() -> None:
+    session = Session(
+        session_id="sess_1",
+        worker_backend="codex",
+        worker_context_id="thread_123",
+        active_run_id="run_123",
+        active_pid=4321,
+        last_run_output_path="/tmp/run.jsonl",
+    )
+
+    restored = Session.model_validate(session.model_dump(mode="json"))
+
+    assert restored.worker_backend == "codex"
+    assert restored.worker_context_id == "thread_123"
+    assert restored.active_run_id == "run_123"
+    assert restored.active_pid == 4321
+    assert restored.last_run_output_path == "/tmp/run.jsonl"
+    assert restored.created_at.tzinfo is not None

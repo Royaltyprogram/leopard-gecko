@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from enum import StrEnum
+from typing import Protocol
 
 from pydantic import BaseModel, Field
 
@@ -30,9 +31,14 @@ class TaskHistoryEntry(BaseModel):
 
 class Session(BaseModel):
     session_id: str
-    terminal_id: str | None = None
     status: SessionStatus = SessionStatus.IDLE
     current_task_id: str | None = None
+    worker_backend: str | None = None
+    worker_context_id: str | None = None
+    active_run_id: str | None = None
+    active_pid: int | None = None
+    active_run_started_at: datetime | None = None
+    last_run_output_path: str | None = None
     queue: list[str] = Field(default_factory=list)
     task_history: list[TaskHistoryEntry] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -43,3 +49,10 @@ class SessionsState(BaseModel):
     sessions: list[Session] = Field(default_factory=list)
     global_queue: list[str] = Field(default_factory=list)
 
+
+class SessionStatusCarrier(Protocol):
+    status: SessionStatus
+
+
+def live_session_count(sessions: list[SessionStatusCarrier]) -> int:
+    return sum(1 for session in sessions if session.status is not SessionStatus.DEAD)

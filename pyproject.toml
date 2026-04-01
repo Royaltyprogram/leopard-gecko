@@ -32,8 +32,10 @@ packages = ["src/leopard_gecko"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "e2e: calls external services for end-to-end verification",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-
