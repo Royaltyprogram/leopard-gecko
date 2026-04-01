@@ -1,0 +1,2 @@
+"""Worker adapter package."""
+

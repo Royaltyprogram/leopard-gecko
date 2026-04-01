@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "leopard-gecko"
+version = "0.1.0"
+description = "Context-routing orchestrator for coding agent terminal sessions."
+readme = "docs/technical-spec.md"
+requires-python = ">=3.12"
+dependencies = [
+  "filelock>=3.16.1",
+  "pydantic>=2.8.2",
+  "pydantic-settings>=2.4.0",
+  "rich>=13.9.4",
+  "typer>=0.12.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3",
+  "ruff>=0.6.9",
+]
+
+[project.scripts]
+lg = "leopard_gecko.cli.main:app"
+leopard-gecko = "leopard_gecko.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/leopard_gecko"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
