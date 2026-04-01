@@ -26,6 +26,7 @@ def test_config_defaults() -> None:
     assert config.router.agent.model == "gpt-5-mini"
     assert config.router.agent.api_key_env_var == "OPENAI_API_KEY"
     assert config.worker.backend is WorkerBackend.NOOP
+    assert config.worker.codex.completed_session_cooldown_sec == 15
     assert config.worktree.enabled is False
     assert config.worktree.branch_prefix == "lg"
     assert config.data_dir == ".leopard-gecko"
@@ -47,6 +48,7 @@ def test_session_state_defaults() -> None:
     assert state.global_queue == []
     assert session.queue == []
     assert session.current_task_id is None
+    assert session.cooldown_until is None
     assert session.worker_backend is None
     assert session.worker_context_id is None
     assert session.worktree_path is None

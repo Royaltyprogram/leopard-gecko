@@ -1,0 +1,91 @@
+Screen {
+    layout: vertical;
+}
+
+/* ── Dashboard ── */
+
+#dashboard-sessions {
+    height: 1fr;
+    margin: 1 2;
+}
+
+#dashboard-gq {
+    height: auto;
+    max-height: 12;
+    margin: 0 2 1 2;
+}
+
+#gq-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#gq-content {
+    color: $text-muted;
+}
+
+/* ── Submit ── */
+
+#submit-log {
+    height: 1fr;
+    margin: 1 2;
+    border: solid $primary-lighten-3;
+}
+
+#submit-input-area {
+    height: auto;
+    margin: 0 2 1 2;
+    layout: horizontal;
+}
+
+#submit-input-area Input {
+    width: 1fr;
+}
+
+#submit-input-area Button {
+    width: 14;
+    margin-left: 1;
+}
+
+/* ── Detail ── */
+
+#detail-header {
+    height: auto;
+    margin: 1 2;
+    padding: 1;
+    border: solid $primary-lighten-3;
+}
+
+#detail-output {
+    height: 1fr;
+    margin: 0 2;
+    border: solid $surface-lighten-1;
+}
+
+#detail-history {
+    height: auto;
+    max-height: 10;
+    margin: 1 2;
+}
+
+#detail-history-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+/* ── Status Bar ── */
+
+StatusBar {
+    dock: bottom;
+    height: 1;
+    background: $primary-darken-2;
+    color: $text;
+    padding: 0 1;
+}
+
+/* ── Colors ── */
+
+.status-idle { color: $success; }
+.status-busy { color: $warning; }
+.status-blocked { color: $error; }
+.status-dead { color: $text-muted; }

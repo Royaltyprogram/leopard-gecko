@@ -1,17 +1,17 @@
 # Patch Needed
 
-이 디렉터리는 현재 코드베이스에서 우선적으로 손봐야 할 6개 패치의 구현 계획을 모아둔 곳이다.
+This directory contains the implementation plans for 6 patches that need to be prioritized in the current codebase.
 
-| Patch | 문서 | 형식 | 핵심 목적 |
+| Patch | Document | Format | Core Purpose |
 |---|---|---|---|
-| 01 | [dispatch-failure-rollback.md](./dispatch-failure-rollback.md) | 체크리스트 중심 계획서 | worker submit 실패 시 세션이 망가진 상태로 남지 않게 롤백 |
-| 02 | [global-queue-autopromotion-rfc.md](./global-queue-autopromotion-rfc.md) | RFC | active run이 없어도 global queue가 자동으로 전진 |
-| 03 | [session-timeout-lifecycle-faq.md](./session-timeout-lifecycle-faq.md) | Q&A / FAQ | timeout, blocked, dead 세션 수명주기 정리 |
-| 04 | [task-snapshot-sync-phases.md](./task-snapshot-sync-phases.md) | 단계별 실행 계획 | task snapshot과 실제 runtime 상태 동기화 |
-| 05 | [poll-io-reduction-matrix.md](./poll-io-reduction-matrix.md) | 표 중심 설계 문서 | poll hot path의 파일 I/O와 로그 쓰기 비용 절감 |
-| 06 | [router-availability-adr.md](./router-availability-adr.md) | ADR | OpenAI 의존 submit 경로에 fallback 추가 |
+| 01 | [dispatch-failure-rollback.md](./dispatch-failure-rollback.md) | Checklist-driven plan | Rollback so sessions don't remain in a broken state when worker submit fails |
+| 02 | [global-queue-autopromotion-rfc.md](./global-queue-autopromotion-rfc.md) | RFC | Global queue advances automatically even without active runs |
+| 03 | [session-timeout-lifecycle-faq.md](./session-timeout-lifecycle-faq.md) | Q&A / FAQ | Clarify timeout, blocked, and dead session lifecycle |
+| 04 | [task-snapshot-sync-phases.md](./task-snapshot-sync-phases.md) | Phased execution plan | Synchronize task snapshot with actual runtime state |
+| 05 | [poll-io-reduction-matrix.md](./poll-io-reduction-matrix.md) | Table-driven design document | Reduce file I/O and log write costs in poll hot path |
+| 06 | [router-availability-adr.md](./router-availability-adr.md) | ADR | Add fallback to the OpenAI-dependent submit path |
 
-## 권장 적용 순서
+## Recommended Application Order
 
 1. `dispatch-failure-rollback.md`
 2. `global-queue-autopromotion-rfc.md`
@@ -20,18 +20,18 @@
 5. `poll-io-reduction-matrix.md`
 6. `router-availability-adr.md`
 
-## 순서 이유
+## Rationale for the Order
 
-- 01은 상태 오염을 막는 안전장치다.
-- 02는 현재 queue starvation을 바로 줄인다.
-- 03은 capacity 회복과 운영 안정성을 만든다.
-- 04는 snapshot을 hot path답게 믿을 수 있게 만든다.
-- 05는 그 다음에 I/O 비용을 줄여도 설계가 덜 흔들린다.
-- 06은 마지막으로 기본 가용성을 올린다.
+- 01 is a safety guard that prevents state corruption.
+- 02 immediately reduces current queue starvation.
+- 03 enables capacity recovery and operational stability.
+- 04 makes snapshots trustworthy as a hot path store.
+- 05 can then reduce I/O costs without destabilizing the design.
+- 06 finally improves baseline availability.
 
-## 공통 원칙
+## Common Principles
 
-- 데이터 무결성을 먼저 고친다.
-- `sessions.json`을 single source of truth로 유지하되, hot path에서는 작은 snapshot 파일을 적극 활용한다.
-- worker에는 계속 `user_prompt`만 전달한다.
-- 새 상태나 이벤트를 추가하더라도 모델은 가능한 한 단순하게 유지한다.
+- Fix data integrity first.
+- Keep `sessions.json` as the single source of truth, but actively use small snapshot files in the hot path.
+- Continue passing only `user_prompt` to workers.
+- Even when adding new states or events, keep the model as simple as possible.

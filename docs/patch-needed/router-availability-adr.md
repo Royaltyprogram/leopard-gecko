@@ -1,132 +1,129 @@
 # ADR: Router Availability Fallback
 
-- 상태: Proposed
-- 날짜: 2026-04-01
-- 결정 대상: submit 경로의 기본 가용성
+- Status: Proposed
+- Date: 2026-04-01
+- Decision Scope: Baseline availability of the submit path
 
 ## Context
 
-현재 기본 submit 경로는 OpenAI 호출 두 번에 의존한다.
+The current default submit path depends on two OpenAI calls.
 
-1. `task_note` 생성
-2. route 결정
+1. `task_note` generation
+2. route decision
 
-이 구조의 문제:
+Problems with this structure:
 
-- API key가 없으면 submit 전체가 실패한다.
-- API timeout이나 structured output 오류도 바로 사용자 실패가 된다.
-- 단순한 local 개발/테스트에도 네트워크 의존이 생긴다.
+- If there is no API key, the entire submit fails.
+- API timeouts or structured output errors also immediately become user-facing failures.
+- Even simple local development/testing requires network dependency.
 
-반면 현재 코드베이스는 lightweight router만 필요로 한다.
-즉 “항상 agent를 불러야만 하는” 구조일 필요가 없다.
+Meanwhile, the current codebase only needs a lightweight router.
+In other words, there is no need for a structure that “always requires calling the agent”.
 
 ## Decision
 
-기본 경로에 fallback을 넣는다.
+Add fallback to the default path.
 
-### 채택 내용
+### Adopted Content
 
-1. task note 생성은 `FallbackTaskNoteGenerator`를 둔다.
-2. route 결정은 `FallbackRouter`를 둔다.
-3. agent 호출 실패 또는 low confidence일 때 heuristic으로 내려간다.
-4. submit은 가능한 한 성공을 우선한다.
+1. Use `FallbackTaskNoteGenerator` for task note generation.
+2. Use `FallbackRouter` for route decisions.
+3. Fall back to heuristics when the agent call fails.
+4. Submit prioritizes success as much as possible.
 
 ## Chosen Design
 
 ### Task note
 
-기본 순서:
+Default order:
 
 1. `AgentTaskNoteGenerator`
-2. 실패 시 `TemplateTaskNoteGenerator`
+2. On failure, `TemplateTaskNoteGenerator`
 
-규칙:
+Rules:
 
-- note 생성 실패는 submit 실패 사유가 되지 않는다.
-- 최악의 경우 template note 하나면 충분하다.
+- Note generation failure must not be a reason for submit failure.
+- In the worst case, a single template note is sufficient.
 
 ### Router
 
-기본 순서:
+Default order:
 
 1. `AgentRouter`
-2. 아래 상황이면 `HeuristicRouter`
-   - API key 없음
+2. `HeuristicRouter` in the following situations:
+   - No API key
    - network error
    - invalid JSON
    - invalid payload
-   - confidence threshold 미만
 
-### HeuristicRouter 초안
+### HeuristicRouter Draft
 
-입력은 현재 session snapshot만 사용한다.
+Input uses only the current session snapshot.
 
 - `task.user_prompt`
 - `task.task_note`
-- 최근 history의 `user_prompt`, `task_note`
+- `user_prompt`, `task_note` from recent history
 - queue limit
-- 남는 capacity
+- remaining capacity
 
-규칙은 단순하게 시작한다.
+Rules start simple.
 
-- 관련 토큰 겹침이 충분하면 existing session
-- 아니고 capacity 남으면 new session
-- 아니면 global queue
+- If related token overlap is sufficient, use existing session
+- Otherwise, if capacity remains, create new session
+- Otherwise, global queue
 
 ## Consequences
 
-### 장점
+### Advantages
 
-- API key 없이도 submit 가능
-- network 문제로 전체 orchestrator가 멈추지 않음
-- e2e agent path는 유지하면서 local usability가 좋아짐
+- Submit is possible even without an API key
+- The entire orchestrator does not stop due to network issues
+- Local usability improves while maintaining the e2e agent path
 
-### 단점
+### Disadvantages
 
-- fallback 결과가 agent 판단보다 덜 정교할 수 있음
-- router 구현이 둘로 나뉘어 테스트 수가 늘어남
+- Fallback results may be less refined than agent decisions
+- The router implementation splits into two, increasing the number of tests
 
 ## Why This Over Alternatives?
 
-### 대안 1. 현재처럼 agent-only 유지
+### Alternative 1. Keep agent-only as is
 
-기각 이유:
+Rejection reason:
 
-- 개발과 운영 가용성이 너무 낮다.
+- Development and operational availability is too low.
 
-### 대안 2. template note만 fallback, router는 agent-only
+### Alternative 2. Fallback only for template note, router remains agent-only
 
-기각 이유:
+Rejection reason:
 
-- 진짜 병목은 router 자체의 네트워크 의존이다.
+- The real bottleneck is the router's own network dependency.
 
-### 대안 3. 아예 heuristic을 기본값으로 바꾸고 agent는 옵션화
+### Alternative 3. Switch heuristic to the default and make agent optional
 
-보류 이유:
+Deferral reason:
 
-- 지금 구조와 사용자 기대를 크게 바꿀 수 있다.
-- 우선은 “agent 우선, 실패 시 fallback”이 더 점진적이다.
+- This could significantly change the current structure and user expectations.
+- For now, “agent first, fallback on failure” is more incremental.
 
 ## Implementation Sketch
 
-### 새 타입
+### New Types
 
 - `HeuristicRouter`
 - `FallbackRouter`
 - `FallbackTaskNoteGenerator`
 
-### config 변경
+### Config Changes
 
-가능하면 작게 간다.
+Keep changes as small as possible.
 
-- `AgentRouterConfig`에 `min_confidence: float = 0.6` 추가 검토
+- Do not add large enum extensions or threshold settings.
 
-그 외에는 큰 enum 확장을 피한다.
+### Factory Changes
 
-### factory 변경
-
-- `build_router()`는 직접 `AgentRouter`를 반환하지 않고 `FallbackRouter(...)`를 반환
-- `_resolve_task_note_port()`도 fallback generator를 사용
+- `build_router()` returns `FallbackRouter(...)` instead of directly returning `AgentRouter`
+- `_resolve_task_note_port()` also uses the fallback generator
 
 ## Files Affected
 
@@ -140,12 +137,11 @@
 
 ## Validation
 
-- API key가 없어도 submit이 성공해야 함
-- agent router가 invalid payload를 반환하면 heuristic으로 fallback
-- low confidence면 fallback
-- agent 성공 경로의 기존 e2e 테스트는 그대로 유지
+- Submit must succeed even without an API key
+- If the agent router returns an invalid payload, fall back to heuristic
+- Existing e2e tests for the agent success path remain unchanged
 
 ## Follow-up
 
-이번 ADR에서는 fallback까지만 다룬다.
-추후 필요하면 heuristic scoring을 더 세련되게 만들 수 있지만, 지금은 단순하고 재현 가능한 규칙이 우선이다.
+This ADR only covers up to the fallback.
+If needed later, heuristic scoring can be made more sophisticated, but for now simple and reproducible rules take priority.

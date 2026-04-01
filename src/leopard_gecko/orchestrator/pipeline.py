@@ -129,6 +129,8 @@ class Orchestrator:
         self.task_repo = TaskRepository(self.paths)
         self.tasks_log = TasksLog(self.paths)
         self.worker = worker
+        self._worker_is_external = worker is not None
+        self._resolved_worker_backend: WorkerBackend | None = None
         self.worker_backend = WorkerBackend(worker_backend) if worker_backend else None
         self.task_note_port = task_note_port
         self.router = router
@@ -536,6 +538,7 @@ class Orchestrator:
 
             transition = self._finalize_run(
                 state=state,
+                config=config,
                 active_run=active_run,
                 run_state=run_state,
             )
@@ -574,6 +577,13 @@ class Orchestrator:
             if transition.next_dispatch is not None:
                 mutation.dispatch_requests.append(transition.next_dispatch)
 
+        mutation.dispatch_requests.extend(
+            self._release_completed_session_cooldowns(
+                state=state,
+                config=config,
+                now=datetime.now(timezone.utc),
+            )
+        )
         mutation.dispatch_requests.extend(self._reserve_dispatchable_global_tasks(state=state, config=config))
         return mutation
 
@@ -620,6 +630,7 @@ class Orchestrator:
         self,
         *,
         state: SessionsState,
+        config: AppConfig,
         active_run: ActiveRun,
         run_state: WorkerRunState,
     ) -> TransitionResult:
@@ -629,11 +640,13 @@ class Orchestrator:
 
         if run_state.exit_code == 0:
             return self._complete_running_task(
+                config=config,
                 session=session,
                 task_id=active_run.task_id,
                 run_state=run_state,
             )
         return self._fail_running_task(
+            config=config,
             session=session,
             task_id=active_run.task_id,
             run_state=run_state,
@@ -659,6 +672,7 @@ class Orchestrator:
         if run_state.worker_context_id:
             session.worker_context_id = run_state.worker_context_id
         session.status = SessionStatus.BLOCKED
+        session.cooldown_until = None
         session.last_heartbeat = now
         _clear_active_run(session)
         return True
@@ -666,11 +680,13 @@ class Orchestrator:
     def _complete_running_task(
         self,
         *,
+        config: AppConfig,
         session: Session,
         task_id: str,
         run_state: WorkerRunState,
     ) -> TransitionResult:
         return self._close_running_task(
+            config=config,
             session=session,
             task_id=task_id,
             next_status=TaskHistoryStatus.COMPLETED,
@@ -680,11 +696,13 @@ class Orchestrator:
     def _fail_running_task(
         self,
         *,
+        config: AppConfig,
         session: Session,
         task_id: str,
         run_state: WorkerRunState,
     ) -> TransitionResult:
         return self._close_running_task(
+            config=config,
             session=session,
             task_id=task_id,
             next_status=TaskHistoryStatus.FAILED,
@@ -694,6 +712,7 @@ class Orchestrator:
     def _close_running_task(
         self,
         *,
+        config: AppConfig,
         session: Session,
         task_id: str,
         next_status: TaskHistoryStatus,
@@ -718,6 +737,7 @@ class Orchestrator:
                 next_task = self._load_task(next_task_id)
                 session.current_task_id = next_task.task_id
                 session.status = SessionStatus.BUSY
+                session.cooldown_until = None
                 next_history_entry = _find_history_entry(session, next_task.task_id)
                 next_history_entry.status = TaskHistoryStatus.RUNNING
                 next_history_entry.updated_at = now
@@ -729,9 +749,71 @@ class Orchestrator:
                     promoted_from_queue="session",
                 )
             else:
-                session.status = SessionStatus.IDLE
+                session.cooldown_until = self._session_completion_cooldown_until(
+                    config=config,
+                    now=now,
+                )
+                session.status = (
+                    SessionStatus.COOLDOWN
+                    if session.cooldown_until is not None
+                    else SessionStatus.IDLE
+                )
 
         return TransitionResult(next_dispatch=next_dispatch)
+
+    def _session_completion_cooldown_until(
+        self,
+        *,
+        config: AppConfig,
+        now: datetime,
+    ) -> datetime | None:
+        if self._selected_backend(config) is not WorkerBackend.CODEX:
+            return None
+
+        seconds = config.worker.codex.completed_session_cooldown_sec
+        if seconds <= 0:
+            return None
+        return now + timedelta(seconds=seconds)
+
+    def _release_completed_session_cooldowns(
+        self,
+        *,
+        state: SessionsState,
+        config: AppConfig,
+        now: datetime,
+    ) -> list[DispatchRequest]:
+        requests: list[DispatchRequest] = []
+
+        for session in state.sessions:
+            if session.status is not SessionStatus.COOLDOWN:
+                continue
+            if session.cooldown_until is None or now < session.cooldown_until:
+                continue
+
+            session.cooldown_until = None
+            if session.queue:
+                next_task_id = session.queue.pop(0)
+                next_task = self._load_task(next_task_id)
+                session.status = SessionStatus.BUSY
+                session.current_task_id = next_task.task_id
+                session.last_heartbeat = now
+                next_history_entry = _find_history_entry(session, next_task.task_id)
+                next_history_entry.status = TaskHistoryStatus.RUNNING
+                next_history_entry.updated_at = now
+                requests.append(
+                    DispatchRequest(
+                        session_id=session.session_id,
+                        task_id=next_task.task_id,
+                        user_prompt=next_task.user_prompt,
+                        original_queue_source="session",
+                        promoted_from_queue="session",
+                    )
+                )
+                continue
+
+            session.status = SessionStatus.IDLE
+
+        return requests
 
     def _promote_next_global_task(
         self,
@@ -837,6 +919,7 @@ class Orchestrator:
         now = datetime.now(timezone.utc)
         session.status = SessionStatus.BUSY
         session.current_task_id = task.task_id
+        session.cooldown_until = None
         session.last_heartbeat = now
         session.task_history.append(
             TaskHistoryEntry(
@@ -867,6 +950,7 @@ class Orchestrator:
             session_id=_generate_prefixed_id("sess"),
             status=SessionStatus.BUSY,
             current_task_id=task.task_id,
+            cooldown_until=None,
             last_heartbeat=now,
         )
         session.task_history.append(
@@ -889,8 +973,12 @@ class Orchestrator:
         )
 
     def _resolve_worker(self, config: AppConfig) -> WorkerPort:
-        if self.worker is None:
+        desired_backend = self._selected_backend(config)
+        if self.worker is None or (
+            not self._worker_is_external and self._resolved_worker_backend is not desired_backend
+        ):
             self.worker = build_worker(config, self.worker_backend)
+            self._resolved_worker_backend = desired_backend
         return self.worker
 
     def _resolve_task_note_port(self, config: AppConfig) -> TaskNotePort:
@@ -925,8 +1013,9 @@ class Orchestrator:
             current_session = _find_session(state, request.session_id)
             now = datetime.now(timezone.utc)
             current_session.worker_backend = dispatch_context.backend
-            if submission.worker_context_id:
-                current_session.worker_context_id = submission.worker_context_id
+            current_session.worker_context_id = (
+                submission.worker_context_id or dispatch_context.worker_context_id
+            )
             current_session.active_run_id = submission.run_id
             current_session.active_pid = submission.process_id
             current_session.active_run_started_at = now
@@ -995,10 +1084,13 @@ class Orchestrator:
 
     def _prepare_dispatch_context(self, *, config: AppConfig, request: DispatchRequest) -> DispatchContext:
         session = _find_session(self.sessions_repo.load(), request.session_id)
+        selected_backend = self._selected_backend(config).value
         dispatch_context = DispatchContext(
             cwd=self.cwd,
-            worker_context_id=session.worker_context_id,
-            backend=session.worker_backend or self._selected_backend(config).value,
+            worker_context_id=(
+                session.worker_context_id if session.worker_backend == selected_backend else None
+            ),
+            backend=selected_backend,
         )
         if not config.worktree.enabled:
             return dispatch_context
@@ -1066,6 +1158,7 @@ class Orchestrator:
                 session.current_task_id = None
             _drop_task_history_entry(session, request.task_id)
             _clear_active_run(session)
+            session.cooldown_until = None
             session.last_heartbeat = now
             if dispatch_context and dispatch_context.worktree and dispatch_context.worktree.created and cleanup_error is None:
                 session.worktree_path = None
@@ -1077,6 +1170,7 @@ class Orchestrator:
                 return
 
             session.status = SessionStatus.IDLE
+            session.cooldown_until = None
 
         self.sessions_repo.update(mutate)
         self._set_task_queue_status(request.task_id, QueueStatus.QUEUED_GLOBALLY)
@@ -1129,6 +1223,7 @@ class Orchestrator:
                     continue
 
                 session.status = SessionStatus.IDLE
+                session.cooldown_until = None
 
         self.sessions_repo.update(mutate)
 

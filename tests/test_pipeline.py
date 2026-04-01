@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from leopard_gecko.adapters.base import WorkerPort, WorkerRunState, WorkerSubmission
-from leopard_gecko.models.config import AppConfig
+from leopard_gecko.models.config import AppConfig, WorkerBackend
 from leopard_gecko.models.session import Session, SessionStatus, TaskHistoryStatus
 from leopard_gecko.models.task import QueueStatus, RoutingDecision, Task
 from leopard_gecko.orchestrator.pipeline import Orchestrator
@@ -188,7 +188,6 @@ class ScenarioRouter:
                 action=RouteAction.ASSIGN_EXISTING,
                 session_id=best_session.session_id,
                 reason=f"matched_for_test score={best_score}",
-                confidence=0.9,
             )
 
         live_sessions = [session for session in sessions if session.status is not SessionStatus.DEAD]
@@ -196,13 +195,11 @@ class ScenarioRouter:
             return RouteDecision(
                 action=RouteAction.CREATE_NEW_SESSION,
                 reason="new_session_for_test",
-                confidence=0.8,
             )
 
         return RouteDecision(
             action=RouteAction.ENQUEUE_GLOBAL,
             reason="global_queue_for_test",
-            confidence=0.7,
         )
 
 
@@ -216,8 +213,8 @@ def test_submit_creates_then_reuses_related_session(tmp_path) -> None:
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
 
     assert first.routing_decision is RoutingDecision.CREATED_NEW_SESSION
     assert first.queue_status is QueueStatus.RUNNING
@@ -266,7 +263,7 @@ def test_submit_uses_session_worktree_when_enabled(tmp_path) -> None:
     )
     orchestrator.config_repo.save(config)
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
+    first = orchestrator.submit("add admin users pagination")
     session = orchestrator.load_sessions().sessions[0]
 
     assert session.session_id == first.assigned_session_id
@@ -274,6 +271,86 @@ def test_submit_uses_session_worktree_when_enabled(tmp_path) -> None:
     assert session.worktree_branch == f"lg/{session.session_id}"
     assert session.worktree_base_ref == "main"
     assert worker.received_cwds == [Path(session.worktree_path)]
+
+
+def test_submit_reuses_idle_session_without_stale_backend_context(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+
+    class ExistingSessionRouter:
+        kind = "existing-session-router"
+        history_limit = 1
+
+        def decide(
+            self,
+            *,
+            task,
+            config,
+            sessions: list[SessionSnapshot],
+            global_queue_size: int,
+        ) -> RouteDecision:
+            del task, config, global_queue_size
+            return RouteDecision(
+                action=RouteAction.ASSIGN_EXISTING,
+                session_id=sessions[0].session_id,
+                reason="reuse stale session for test",
+            )
+
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ExistingSessionRouter(),
+    )
+    base_config = orchestrator.init_storage()
+    config = base_config.model_copy(
+        update={
+            "worker": base_config.worker.model_copy(update={"backend": WorkerBackend.CODEX})
+        }
+    )
+    orchestrator.config_repo.save(config)
+
+    orchestrator.sessions_repo.update(
+        lambda state: state.sessions.append(
+            Session(
+                session_id="sess_stale",
+                status=SessionStatus.IDLE,
+                worker_backend="noop",
+                worker_context_id="noop:sess_stale",
+            )
+        )
+    )
+
+    result = orchestrator.submit("create a simple html page")
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert result.assigned_session_id == "sess_stale"
+    assert worker.received_context_ids == [None]
+    assert session.worker_backend == WorkerBackend.CODEX.value
+    assert session.worker_context_id == worker.submissions[0].worker_context_id
+
+
+def test_resolve_worker_rebuilds_cached_worker_after_backend_change(tmp_path, monkeypatch) -> None:
+    orchestrator = Orchestrator(data_dir=str(tmp_path / ".leopard-gecko"))
+    config = orchestrator.init_storage()
+    seen: list[WorkerBackend] = []
+
+    def fake_build_worker(config: AppConfig, backend_override=None):
+        backend = backend_override or config.worker.backend
+        seen.append(backend)
+        return object()
+
+    monkeypatch.setattr("leopard_gecko.orchestrator.pipeline.build_worker", fake_build_worker)
+
+    first_worker = orchestrator._resolve_worker(config)
+    updated_config = config.model_copy(
+        update={
+            "worker": config.worker.model_copy(update={"backend": WorkerBackend.CODEX})
+        }
+    )
+    second_worker = orchestrator._resolve_worker(updated_config)
+
+    assert first_worker is not second_worker
+    assert seen == [WorkerBackend.NOOP, WorkerBackend.CODEX]
 
 
 def test_poll_reuses_same_session_worktree_for_follow_up_dispatch(tmp_path) -> None:
@@ -300,8 +377,8 @@ def test_poll_reuses_same_session_worktree_for_follow_up_dispatch(tmp_path) -> N
     )
     orchestrator.config_repo.save(config)
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=False,
@@ -346,7 +423,7 @@ def test_submit_dispatch_failure_removes_created_worktree_for_new_session(tmp_pa
     orchestrator.config_repo.save(config)
 
     with pytest.raises(RuntimeError, match="worker submit blew up"):
-        orchestrator.submit("admin users pagination 추가해줘")
+        orchestrator.submit("add admin users pagination")
 
     assert orchestrator.load_sessions().sessions == []
     assert list(worktree_root.glob("*")) == []
@@ -363,7 +440,7 @@ def test_submit_dispatch_failure_rolls_back_created_session(tmp_path) -> None:
     )
 
     with pytest.raises(RuntimeError, match="worker submit blew up"):
-        orchestrator.submit("admin users pagination 추가해줘")
+        orchestrator.submit("add admin users pagination")
 
     sessions_state = orchestrator.load_sessions()
     task_id = next(iter(orchestrator.paths.tasks_dir.glob("task_*.json"))).stem
@@ -389,7 +466,7 @@ def test_submit_dispatch_failure_restores_existing_idle_session(tmp_path) -> Non
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
+    first = orchestrator.submit("add admin users pagination")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=False,
@@ -401,7 +478,7 @@ def test_submit_dispatch_failure_restores_existing_idle_session(tmp_path) -> Non
 
     worker.fail_next_submit("idle session submit failed")
     with pytest.raises(RuntimeError, match="idle session submit failed"):
-        orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+        orchestrator.submit("also fix admin users pagination button style")
 
     sessions_state = orchestrator.load_sessions()
     session = sessions_state.sessions[0]
@@ -432,8 +509,8 @@ def test_poll_completion_dispatches_next_queued_task(tmp_path) -> None:
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=False,
@@ -460,6 +537,125 @@ def test_poll_completion_dispatches_next_queued_task(tmp_path) -> None:
     assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.RUNNING
 
 
+def test_codex_completion_enters_cooldown_before_becoming_idle(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = orchestrator.init_storage().model_copy(
+        update={
+            "worker": AppConfig.default().worker.model_copy(
+                update={
+                    "backend": WorkerBackend.CODEX,
+                    "codex": AppConfig.default().worker.codex.model_copy(
+                        update={"completed_session_cooldown_sec": 15}
+                    ),
+                }
+            )
+        }
+    )
+    orchestrator.config_repo.save(config)
+
+    first = orchestrator.submit("add admin users pagination")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_done",
+        last_message="done",
+    )
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert poll_result.completed == 1
+    assert poll_result.dispatched == 0
+    assert session.status is SessionStatus.COOLDOWN
+    assert session.current_task_id is None
+    assert session.cooldown_until is not None
+
+    orchestrator.sessions_repo.update(
+        lambda state: setattr(
+            state.sessions[0],
+            "cooldown_until",
+            datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+    )
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert poll_result.completed == 0
+    assert poll_result.dispatched == 0
+    assert session.status is SessionStatus.IDLE
+    assert session.cooldown_until is None
+    assert orchestrator.task_repo.load(first.task_id).queue_status is QueueStatus.COMPLETED
+
+
+def test_submit_during_codex_cooldown_queues_follow_up_until_cooldown_expires(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = orchestrator.init_storage().model_copy(
+        update={
+            "worker": AppConfig.default().worker.model_copy(
+                update={
+                    "backend": WorkerBackend.CODEX,
+                    "codex": AppConfig.default().worker.codex.model_copy(
+                        update={"completed_session_cooldown_sec": 15}
+                    ),
+                }
+            )
+        }
+    )
+    orchestrator.config_repo.save(config)
+
+    first = orchestrator.submit("add admin users pagination")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_done",
+        last_message="done",
+    )
+    orchestrator.poll_runs()
+
+    second = orchestrator.submit("also fix admin users pagination button style")
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert second.queue_status is QueueStatus.QUEUED_IN_SESSION
+    assert second.assigned_session_id == first.assigned_session_id
+    assert session.status is SessionStatus.COOLDOWN
+    assert session.current_task_id is None
+    assert session.queue == [second.task_id]
+
+    orchestrator.sessions_repo.update(
+        lambda state: setattr(
+            state.sessions[0],
+            "cooldown_until",
+            datetime.now(timezone.utc) - timedelta(seconds=1),
+        )
+    )
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert poll_result.completed == 0
+    assert poll_result.dispatched == 1
+    assert session.status is SessionStatus.BUSY
+    assert session.current_task_id == second.task_id
+    assert session.queue == []
+    assert worker.received_context_ids == [None, "ctx_done"]
+    assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.RUNNING
+
+
 def test_poll_completion_promotes_session_queue_from_task_snapshot_when_log_is_missing(tmp_path) -> None:
     worker = FakeWorkerAdapter()
     orchestrator = Orchestrator(
@@ -469,8 +665,8 @@ def test_poll_completion_promotes_session_queue_from_task_snapshot_when_log_is_m
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
     orchestrator.paths.tasks_log_path.unlink()
     worker.set_poll_state(
         worker.submissions[0].run_id,
@@ -500,14 +696,14 @@ def test_load_task_falls_back_to_log_and_backfills_snapshot(tmp_path) -> None:
         router=ScenarioRouter(),
     )
 
-    result = orchestrator.submit("payments export 기능 추가해줘")
+    result = orchestrator.submit("add payments export feature")
     snapshot_path = orchestrator.paths.tasks_dir / f"{result.task_id}.json"
     snapshot_path.unlink()
 
     restored = orchestrator._load_task(result.task_id)
 
     assert restored.task_id == result.task_id
-    assert restored.user_prompt == "payments export 기능 추가해줘"
+    assert restored.user_prompt == "add payments export feature"
     assert snapshot_path.exists()
 
 
@@ -521,8 +717,8 @@ def test_poll_failure_still_dispatches_next_queued_task(tmp_path) -> None:
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=False,
@@ -556,8 +752,8 @@ def test_poll_completion_rolls_back_failed_session_queue_dispatch(tmp_path) -> N
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=False,
@@ -594,7 +790,7 @@ def test_poll_running_updates_worker_context(tmp_path) -> None:
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
+    first = orchestrator.submit("add admin users pagination")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=True,
@@ -619,7 +815,7 @@ def test_poll_running_does_not_append_heartbeat_events(tmp_path) -> None:
         router=ScenarioRouter(),
     )
 
-    orchestrator.submit("admin users pagination 추가해줘")
+    orchestrator.submit("add admin users pagination")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=True,
@@ -643,9 +839,9 @@ def test_poll_running_batch_writes_sessions_once_for_active_runs(tmp_path, monke
     )
 
     for prompt in (
-        "admin users pagination 추가해줘",
-        "payments export 기능 추가해줘",
-        "dashboard filter 고쳐줘",
+        "add admin users pagination",
+        "add payments export feature",
+        "fix dashboard filter",
     ):
         orchestrator.submit(prompt)
 
@@ -684,8 +880,8 @@ def test_idle_session_promotes_global_queue(tmp_path) -> None:
     config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(config)
 
-    orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
+    orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=False,
@@ -721,8 +917,8 @@ def test_global_queue_stays_waiting_when_capacity_is_full(tmp_path) -> None:
     config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(config)
 
-    orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
+    orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
 
     promoted = orchestrator._promote_next_global_task(config)
     sessions_state = orchestrator.load_sessions()
@@ -747,8 +943,8 @@ def test_dead_session_allows_global_queue_promotion_into_new_session(tmp_path) -
     config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(config)
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
 
     def mark_session_dead(state) -> None:
         session = state.sessions[0]
@@ -810,7 +1006,7 @@ def test_submit_expires_stale_idle_session_before_routing(tmp_path) -> None:
 
     orchestrator.sessions_repo.update(seed_stale_idle)
 
-    result = orchestrator.submit("stale idle session cleanup 확인")
+    result = orchestrator.submit("verify stale idle session cleanup")
     sessions_state = orchestrator.load_sessions()
     stale_session = sessions_state.sessions[0]
     new_session = sessions_state.sessions[1]
@@ -844,7 +1040,7 @@ def test_poll_expires_stale_blocked_session_and_requeues_current_task(tmp_path) 
     config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(config)
 
-    submission = orchestrator.submit("manual recovery 이후 stale blocked session")
+    submission = orchestrator.submit("stale blocked session after manual recovery")
 
     def mark_blocked_and_stale(state) -> None:
         session = state.sessions[0]
@@ -896,8 +1092,8 @@ def test_submit_expires_stale_busy_session_without_active_run_and_requeues_all_w
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
 
     def break_busy_session(state) -> None:
         session = state.sessions[0]
@@ -909,7 +1105,7 @@ def test_submit_expires_stale_busy_session_without_active_run_and_requeues_all_w
 
     orchestrator.sessions_repo.update(break_busy_session)
 
-    third = orchestrator.submit("payments export 기능 추가해줘")
+    third = orchestrator.submit("add payments export feature")
     sessions_state = orchestrator.load_sessions()
     session = sessions_state.sessions[0]
     replacement_session = sessions_state.sessions[1]
@@ -985,8 +1181,8 @@ def test_poll_runs_auto_promotes_global_queue_with_no_active_runs_into_idle_sess
     config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(config)
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
 
     def make_idle(state) -> None:
         session = state.sessions[0]
@@ -1024,8 +1220,8 @@ def test_poll_runs_auto_promotes_global_queue_with_no_active_runs_into_new_sessi
     initial_config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(initial_config)
 
-    orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
+    orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
     next_config = initial_config.model_copy(update={"max_terminal_num": 2})
     orchestrator.config_repo.save(next_config)
 
@@ -1063,8 +1259,8 @@ def test_poll_runs_leaves_global_queue_waiting_when_no_active_runs_and_capacity_
     config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(config)
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
 
     def make_blocked(state) -> None:
         session = state.sessions[0]
@@ -1097,9 +1293,9 @@ def test_poll_runs_bulk_promotes_global_queue_up_to_idle_and_remaining_capacity(
     initial_config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(initial_config)
 
-    orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
-    third = orchestrator.submit("analytics export 기능 추가해줘")
+    orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
+    third = orchestrator.submit("add analytics export feature")
     next_config = initial_config.model_copy(update={"max_terminal_num": 2})
     orchestrator.config_repo.save(next_config)
 
@@ -1138,9 +1334,9 @@ def test_poll_runs_stops_bulk_global_promotion_after_first_dispatch_failure(tmp_
     initial_config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(initial_config)
 
-    orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
-    third = orchestrator.submit("analytics export 기능 추가해줘")
+    orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
+    third = orchestrator.submit("add analytics export feature")
     next_config = initial_config.model_copy(update={"max_terminal_num": 2})
     orchestrator.config_repo.save(next_config)
     worker.fail_task_ids.add(second.task_id)
@@ -1178,8 +1374,8 @@ def test_global_queue_dispatch_failure_restores_front_of_queue(tmp_path) -> None
     config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
     orchestrator.config_repo.save(config)
 
-    orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("payments export 기능 추가해줘")
+    orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("add payments export feature")
     worker.set_poll_state(
         worker.submissions[0].run_id,
         is_running=False,
@@ -1226,11 +1422,11 @@ def test_submit_persists_task_before_sessions_mutation(tmp_path, monkeypatch) ->
     monkeypatch.setattr(orchestrator.sessions_repo, "update", fail_update)
 
     with pytest.raises(RuntimeError, match="sessions update failed"):
-        orchestrator.submit("admin users pagination 추가해줘")
+        orchestrator.submit("add admin users pagination")
 
     restored = orchestrator.task_repo.load(task_id)
     assert restored.task_id == task_id
-    assert restored.user_prompt == "admin users pagination 추가해줘"
+    assert restored.user_prompt == "add admin users pagination"
     events = orchestrator.tasks_log.read_all()
     assert len(events) == 1
     assert events[0].event_type == "task_created"
@@ -1247,8 +1443,8 @@ def test_load_task_uses_snapshot_when_task_created_log_is_missing(tmp_path) -> N
         router=ScenarioRouter(),
     )
 
-    first = orchestrator.submit("admin users pagination 추가해줘")
-    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
     orchestrator.paths.tasks_log_path.write_text("", encoding="utf-8")
     worker.set_poll_state(
         worker.submissions[0].run_id,
@@ -1315,7 +1511,7 @@ def test_submit_raises_when_router_returns_invalid_existing_session(tmp_path) ->
     )
 
     with pytest.raises(RoutingError, match="unknown session_id"):
-        orchestrator.submit("admin users pagination 추가해줘")
+        orchestrator.submit("add admin users pagination")
 
 
 def test_submit_raises_when_default_task_note_generator_cannot_run(tmp_path, monkeypatch) -> None:
@@ -1327,7 +1523,7 @@ def test_submit_raises_when_default_task_note_generator_cannot_run(tmp_path, mon
     )
 
     with pytest.raises(RoutingError, match="Missing OpenAI API key"):
-        orchestrator.submit("admin users pagination 추가해줘")
+        orchestrator.submit("add admin users pagination")
 
 
 def _history_status(session, task_id: str) -> TaskHistoryStatus:

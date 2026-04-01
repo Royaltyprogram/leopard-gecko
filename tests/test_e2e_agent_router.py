@@ -44,7 +44,7 @@ def test_submit_routes_with_real_agent_router_using_dotenv(tmp_path, monkeypatch
     data_dir = tmp_path / ".leopard-gecko"
     orchestrator = Orchestrator(data_dir=str(data_dir), worker=worker)
 
-    result = orchestrator.submit("관리자 유저 목록 pagination 작업용 새 세션을 시작해줘")
+    result = orchestrator.submit("start a new session for the admin user list pagination task")
     sessions_state = orchestrator.load_sessions()
 
     assert result.routing_decision is RoutingDecision.CREATED_NEW_SESSION

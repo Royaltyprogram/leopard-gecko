@@ -79,7 +79,7 @@ def test_agent_task_note_generator_calls_openai_responses(monkeypatch) -> None:
                             "type": "output_text",
                             "text": json.dumps(
                                 {
-                                    "task_note": "admin/users 목록 기능 확장으로 보임.",
+                                    "task_note": "Appears to be an extension of the admin/users list feature.",
                                 }
                             ),
                         }
@@ -93,9 +93,9 @@ def test_agent_task_note_generator_calls_openai_responses(monkeypatch) -> None:
         transport=transport,
     )
 
-    note = generator.make_note("관리자 유저 목록에 pagination 붙여줘")
+    note = generator.make_note("add pagination to admin user list")
 
-    assert note == "admin/users 목록 기능 확장으로 보임."
+    assert note == "Appears to be an extension of the admin/users list feature."
     assert transport.calls[0]["api_key"] == "test-key"
     payload = transport.calls[0]["payload"]
     assert payload["model"] == "gpt-5"
@@ -127,7 +127,6 @@ def test_agent_router_calls_openai_responses_with_structured_output(monkeypatch)
                                     "action": "assign_existing",
                                     "session_id": "sess_auth",
                                     "reason": "Same auth flow.",
-                                    "confidence": 0.93,
                                 }
                             ),
                         }
@@ -140,7 +139,7 @@ def test_agent_router_calls_openai_responses_with_structured_output(monkeypatch)
     config = AppConfig.default()
     task = Task(
         task_id="task_new",
-        user_prompt="401/403 에러 처리도 이어서 해줘",
+        user_prompt="continue with 401/403 error handling as well",
         task_note="auth error handling",
     )
     session = Session(
@@ -150,7 +149,7 @@ def test_agent_router_calls_openai_responses_with_structured_output(monkeypatch)
         task_history=[
             TaskHistoryEntry(
                 task_id="task_auth",
-                user_prompt="auth 에러 처리 정리해줘",
+                user_prompt="clean up auth error handling",
                 task_note="auth error handling",
                 status=TaskHistoryStatus.RUNNING,
             )

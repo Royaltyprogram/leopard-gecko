@@ -1,112 +1,112 @@
 # Poll Worker Loop Plan
 
-> 목표: `lg poll` 수동 실행에 의존하지 않고, run 완료 처리와 queue 승격이 자동으로 진행되게 만든다.
+> Goal: Remove the dependency on manual `lg poll` execution and make run completion handling and queue promotion proceed automatically.
 
-## 문제
+## Problem
 
-현재 lifecycle 전이는 `lg poll` 호출에 의존한다.
-사용자나 외부 supervisor가 poll을 주기적으로 돌려주지 않으면:
+Currently, lifecycle transitions depend on `lg poll` invocations.
+If the user or an external supervisor does not run poll periodically:
 
-- 완료 반영
-- session queue 다음 task 실행
-- global queue 승격
-- heartbeat 갱신
+- Completion reflection
+- Executing the next task in the session queue
+- Global queue promotion
+- Heartbeat updates
 
-이 모두 멈춘다.
+All of these stall.
 
-## 목표 상태
+## Target State
 
-- 기본 사용 시에도 poll loop가 자동으로 유지된다.
-- CLI는 one-shot submit만 제공하더라도 백그라운드 루프가 동일 data dir에서 상태를 계속 전진시킨다.
-- 수동 `lg poll`은 디버깅/운영용 fallback으로 남긴다.
+- The poll loop is automatically maintained even during normal usage.
+- Even if the CLI only provides one-shot submit, a background loop continues advancing state in the same data dir.
+- Manual `lg poll` remains as a debugging/operations fallback.
 
-## 구현 방향
+## Implementation Approach
 
-### 방향 1. 별도 `lg worker` 커맨드 추가
+### Approach 1. Add a separate `lg worker` command
 
-가장 단순하고 예측 가능한 방식은 long-running loop를 명시적 커맨드로 두는 것이다.
+The simplest and most predictable approach is to make the long-running loop an explicit command.
 
 - `lg worker`
-- 일정 주기로 `orchestrator.poll_runs()` 호출
-- 한 번에 여러 active run 처리
-- 종료 신호를 받으면 안전하게 빠짐
+- Calls `orchestrator.poll_runs()` at regular intervals
+- Handles multiple active runs at once
+- Exits gracefully upon receiving a termination signal
 
-이 방식은 hidden daemon보다 단순하고 테스트가 쉽다.
+This approach is simpler and easier to test than a hidden daemon.
 
-### 방향 2. 추후 자동 기동은 선택 사항으로 남김
+### Approach 2. Leave automatic startup as an option for later
 
-당장은 submit 시 worker를 몰래 띄우기보다, 명시적 프로세스로 운영하는 편이 낫다.
-MVP에서는 관찰 가능성과 단순성이 더 중요하다.
+For now, it is better to operate as an explicit process rather than silently spawning a worker on submit.
+For the MVP, observability and simplicity are more important.
 
-## 변경 대상
+## Files to Change
 
 - `src/leopard_gecko/cli/main.py`
 - `src/leopard_gecko/orchestrator/pipeline.py`
-- 신규 파일: `src/leopard_gecko/orchestrator/worker_loop.py`
+- New file: `src/leopard_gecko/orchestrator/worker_loop.py`
 - `tests/test_pipeline.py`
-- 신규 테스트 파일: `tests/test_worker_loop.py`
+- New test file: `tests/test_worker_loop.py`
 
-## 세부 구현 계획
+## Detailed Implementation Plan
 
-### 1. worker loop abstraction 추가
+### 1. Add worker loop abstraction
 
-`worker_loop.py`에 아래와 같은 thin loop를 둔다.
+Place a thin loop in `worker_loop.py` like the following:
 
 - `run_worker_loop(orchestrator, interval_sec, once=False) -> int`
 
-역할:
+Responsibilities:
 
 - `poll_runs()`
-- 결과 집계
+- Result aggregation
 - sleep
 - signal handling
 
-### 2. CLI command 추가
+### 2. Add CLI command
 
-`main.py`에 아래 커맨드를 추가한다.
+Add the following command to `main.py`:
 
 - `lg worker`
-- 옵션:
+- Options:
   - `--interval-sec`
   - `--once`
   - `--data-dir`
 
-`--once`는 현재의 `poll`을 대체하거나 내부적으로 재사용할 수 있다.
+`--once` can replace or internally reuse the current `poll`.
 
-### 3. idle backoff 정책
+### 3. Idle backoff policy
 
-active run이 없고 global queue도 비어 있으면 polling 간격을 늘리는 단순 backoff를 넣을 수 있다.
-다만 첫 버전은 고정 interval로 유지하는 편이 더 단순하다.
+A simple backoff that increases the polling interval when there are no active runs and the global queue is empty can be added.
+However, keeping a fixed interval for the first version is simpler.
 
-### 4. 상태 출력 정리
+### 4. Clean up status output
 
-worker loop는 사람이 읽을 수 있는 간단한 로그만 남긴다.
+The worker loop should only leave simple, human-readable logs.
 
 - `running`
 - `completed`
 - `failed`
 - `dispatched`
 
-너무 많은 상세 출력은 피한다.
+Avoid excessive detailed output.
 
-## 테스트 계획
+## Test Plan
 
-- `--once` 모드에서 현재 `poll`과 동일하게 동작해야 함
-- 완료된 task가 자동으로 다음 queue task를 dispatch하는지 검증
-- 빈 상태에서도 loop가 예외 없이 종료되는지 검증
-- interrupt signal 처리 테스트는 가능 범위에서 최소화
+- In `--once` mode, behavior should be identical to the current `poll`
+- Verify that a completed task automatically dispatches the next queue task
+- Verify that the loop exits without exceptions even in an empty state
+- Minimize interrupt signal handling tests to a reasonable scope
 
-## 구현 순서
+## Implementation Order
 
-1. worker loop 함수 분리
-2. `lg worker` CLI 추가
-3. `poll`과 공통 출력 경로 정리
-4. loop 테스트 추가
+1. Extract worker loop function
+2. Add `lg worker` CLI
+3. Clean up common output paths with `poll`
+4. Add loop tests
 
-## 비목표
+## Non-Goals
 
-- OS 서비스 등록
-- 완전한 daemon supervisor
-- 멀티프로세스 클러스터링
+- OS service registration
+- Full daemon supervisor
+- Multi-process clustering
 
-지금 단계에서는 "수동 poll이 아니어도 시스템이 움직인다"까지만 만들면 충분하다.
+At this stage, it is sufficient to achieve "the system moves forward even without manual poll".

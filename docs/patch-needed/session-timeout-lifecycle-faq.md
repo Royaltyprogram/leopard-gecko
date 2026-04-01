@@ -1,94 +1,94 @@
 # Session Timeout And Lifecycle FAQ
 
-> 형식: Q&A
-> 목표: `session_idle_timeout_min`을 실제 lifecycle 규칙으로 연결하고, blocked/dead 세션이 capacity를 영구 점유하지 않게 만든다.
+> Format: Q&A
+> Goal: Connect `session_idle_timeout_min` to actual lifecycle rules, and prevent blocked/dead sessions from permanently occupying capacity.
 
-## Q1. 지금 뭐가 문제인가?
+## Q1. What is the problem right now?
 
-설정에는 `session_idle_timeout_min`이 있지만, 현재 코드는 이 값을 사용해 세션을 만료시키지 않는다.
-그 결과:
+The config has `session_idle_timeout_min`, but the current code does not use this value to expire sessions.
+As a result:
 
-- 오래된 idle session이 계속 살아 있는 것으로 계산될 수 있고
-- blocked session도 slot을 계속 먹고
-- dead 전환 규칙이 수동 테스트에만 머물게 된다.
+- Old idle sessions may continue to be counted as alive
+- Blocked sessions keep consuming slots
+- Dead transition rules remain limited to manual testing
 
-## Q2. 이번 패치의 핵심 목표는?
+## Q2. What is the core goal of this patch?
 
-세 가지다.
+Three things:
 
-1. stale session을 자동으로 `dead`로 전환한다.
-2. dead 전환 시 queue와 current task를 복구 가능한 위치로 이동시킨다.
-3. capacity 계산에서 “실제로 다시 쓸 수 없는 세션”을 풀어준다.
+1. Automatically transition stale sessions to `dead`.
+2. On dead transition, move the queue and current task to a recoverable location.
+3. Release sessions that “cannot actually be reused” from capacity calculations.
 
-## Q3. 언제 세션을 stale로 볼 건가?
+## Q3. When should a session be considered stale?
 
-기본 규칙은 단순하게 간다.
+The basic rule is kept simple:
 
 - `now - last_heartbeat > session_idle_timeout_min`
 
-그리고 상태별 해석은 아래처럼 둔다.
+And per-status interpretation is as follows:
 
-| 상태 | stale 판단 시 처리 |
+| Status | Action when determined stale |
 |---|---|
-| `idle` | `dead` 전환 |
-| `blocked` | `dead` 전환 |
-| `busy` + active run 정보 존재 | 먼저 worker poll 결과를 보고, 그래도 진행 불명확하면 `dead` 전환 후보 |
-| `busy` + active run 정보 없음 | 즉시 비정상 상태로 보고 `dead` 전환 후보 |
+| `idle` | Transition to `dead` |
+| `blocked` | Transition to `dead` |
+| `busy` + active run info exists | First check worker poll results; if progress is still unclear, candidate for `dead` transition |
+| `busy` + no active run info | Immediately considered abnormal; candidate for `dead` transition |
 
-## Q4. dead 전환 시 task는 어떻게 처리하나?
+## Q4. How are tasks handled during dead transition?
 
-가장 단순한 규칙을 택한다.
+Choose the simplest rule:
 
-- `current_task_id`가 있으면 global queue 앞으로 이동
-- session queue에 있던 task들도 순서를 유지한 채 global queue 앞으로 이동
-- session의 `current_task_id`, `queue`, `active_run_*`는 비운다
+- If `current_task_id` exists, move it to the front of the global queue
+- Tasks that were in the session queue are also moved to the front of the global queue, preserving order
+- Clear the session's `current_task_id`, `queue`, and `active_run_*`
 
-왜 global queue인가?
+Why global queue?
 
-- 특정 dead session에 task를 묶어 둘 이유가 없다.
-- 이후 scheduler가 healthy session에 다시 분배하면 된다.
+- There is no reason to keep tasks tied to a specific dead session.
+- The scheduler can redistribute them to healthy sessions later.
 
-## Q5. blocked session은 바로 dead로 바꿀까?
+## Q5. Should blocked sessions be converted to dead immediately?
 
-아니다.
+No.
 
-처음 blocked는 유지한다.
-하지만 heartbeat가 오래 갱신되지 않으면 dead로 내린다.
+Initially, blocked status is maintained.
+However, if the heartbeat has not been updated for a long time, it is demoted to dead.
 
-이렇게 하면:
+This way:
 
-- 짧은 수동 확인 시간은 허용하고
-- 무기한 slot 점유는 막을 수 있다.
+- A short window for manual verification is allowed
+- Indefinite slot occupation is prevented
 
-## Q6. capacity 계산 함수는 어떻게 바꿔야 하나?
+## Q6. How should the capacity calculation function be changed?
 
-두 층으로 나누는 편이 안전하다.
+It is safer to split into two layers:
 
-- `live_session_count`: 기존 의미 유지 또는 최소 수정
-- `allocatable_session_count` 또는 `routable_session_count`: 실제 새 task 배정 가능성에 가까운 계산
+- `live_session_count`: Maintain existing meaning or make minimal modifications
+- `allocatable_session_count` or `routable_session_count`: A calculation closer to actual new task assignment possibility
 
-권장 방향:
+Recommended direction:
 
-- 라우팅과 global promotion에서 slot 가용성 판단은 stale cleanup 이후 상태를 기준으로 한다.
-- 즉 먼저 stale session을 정리하고, 그 다음 기존 `live_session_count`를 써도 된다.
+- Slot availability decisions in routing and global promotion should be based on the state after stale cleanup.
+- That is, clean up stale sessions first, then use the existing `live_session_count`.
 
-이 방식이 가장 덜 침습적이다.
+This approach is the least invasive.
 
-## Q7. 이 로직은 어디서 실행해야 하나?
+## Q7. Where should this logic run?
 
-두 군데가 좋다.
+Two places are good:
 
-1. `poll_runs()` 시작 직후
-2. `submit()` 초반, route 결정 전에
+1. Right after `poll_runs()` starts
+2. Early in `submit()`, before the route decision
 
-이유:
+Reason:
 
-- worker loop가 돌고 있으면 자동 회복
-- worker loop가 느리거나 잠시 멈춰도 submit 시점에 stale slot을 치울 수 있음
+- If the worker loop is running, automatic recovery occurs
+- Even if the worker loop is slow or briefly paused, stale slots can be cleared at submit time
 
-## Q8. 어떤 helper를 추가하면 좋은가?
+## Q8. What helpers should be added?
 
-후보는 아래 둘이다.
+The two candidates are:
 
 ```python
 def _expire_stale_sessions(self, state: SessionsState, config: AppConfig, now: datetime) -> ExpireResult:
@@ -98,39 +98,39 @@ def _requeue_dead_session_tasks(session: Session, state: SessionsState) -> list[
     ...
 ```
 
-`ExpireResult`에는 아래 정도만 있으면 충분하다.
+`ExpireResult` only needs the following:
 
 - `expired_session_ids`
 - `requeued_task_ids`
 
-## Q9. 어떤 이벤트를 남겨야 하나?
+## Q9. What events should be recorded?
 
-최소 이벤트:
+Minimum events:
 
 - `session_expired`
 - `task_requeued_from_dead_session`
 
-payload 예시:
+Payload example:
 
 - `session_id`
 - `previous_status`
 - `reason=stale_timeout`
 - `task_ids`
 
-## Q10. 테스트는 어떻게 잡는가?
+## Q10. How should tests be structured?
 
-반드시 필요한 테스트:
+Required tests:
 
-- stale idle session이 submit 전에 dead 처리되고 새 session 생성이 가능해짐
-- stale blocked session이 poll에서 dead 처리됨
-- dead 전환 시 `current_task_id`와 queue task가 global queue로 이동
-- dead 전환 후 세션 active run 정보가 비워짐
-- dead 처리 이후 capacity가 회복돼 global queue 승격이 가능해짐
+- A stale idle session is marked dead before submit, and creating a new session becomes possible
+- A stale blocked session is marked dead during poll
+- On dead transition, `current_task_id` and queue tasks move to the global queue
+- After dead transition, session active run information is cleared
+- After dead processing, capacity is recovered and global queue promotion becomes possible
 
-## Q11. 이번 패치에서 굳이 하지 않아도 되는 것은?
+## Q11. What does not need to be done in this patch?
 
-- 세밀한 grace period별 상태 추가
-- “suspect”, “recovering” 같은 중간 상태
-- OS 프로세스 레벨 생존 확인 강화
+- Adding fine-grained per-grace-period states
+- Intermediate states like “suspect” or “recovering”
+- Strengthening OS process-level liveness checks
 
-이번 단계는 stale timeout을 실제로 동작하게 만드는 데 집중하면 충분하다.
+For this phase, it is sufficient to focus on making the stale timeout actually work.

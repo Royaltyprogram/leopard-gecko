@@ -32,7 +32,6 @@ class RouteDecision(BaseModel):
     action: RouteAction
     session_id: str | None = None
     reason: str
-    confidence: float | None = None
 
 
 class ContextRouter(Protocol):

@@ -1,7 +1,11 @@
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 import typer
 
+load_dotenv()
+
+from leopard_gecko.models.session import SessionStatus
 from leopard_gecko.models.config import WorkerBackend
 from leopard_gecko.orchestrator.pipeline import Orchestrator, PollRunsResult
 from leopard_gecko.orchestrator.worker_loop import run_worker_loop
@@ -23,7 +27,7 @@ def _print_poll_result(result: PollRunsResult) -> None:
 def init(
     data_dir: str | None = typer.Option(None, help="Override data directory"),
     worker_backend: WorkerBackend = typer.Option(
-        WorkerBackend.NOOP,
+        WorkerBackend.CODEX,
         "--worker-backend",
         help="Default worker backend to store in config",
     ),
@@ -72,10 +76,12 @@ def status(data_dir: str | None = typer.Option(None, help="Override data directo
     state = orchestrator.load_sessions()
     sessions = state.sessions
 
-    busy_count = sum(1 for session in sessions if session.status == "busy")
-    idle_count = sum(1 for session in sessions if session.status == "idle")
-    blocked_count = sum(1 for session in sessions if session.status == "blocked")
-    dead_count = sum(1 for session in sessions if session.status == "dead")
+    busy_count = sum(
+        1 for session in sessions if session.status in {SessionStatus.BUSY, SessionStatus.COOLDOWN}
+    )
+    idle_count = sum(1 for session in sessions if session.status is SessionStatus.IDLE)
+    blocked_count = sum(1 for session in sessions if session.status is SessionStatus.BLOCKED)
+    dead_count = sum(1 for session in sessions if session.status is SessionStatus.DEAD)
 
     console.print(f"data_dir={orchestrator.paths.root_dir}")
     console.print(f"router_backend={config.router.backend}")
@@ -134,6 +140,17 @@ def sessions(data_dir: str | None = typer.Option(None, help="Override data direc
         )
 
     console.print(table)
+
+
+@app.command()
+def tui(
+    data_dir: str | None = typer.Option(None, help="Override data directory"),
+    poll_interval: float = typer.Option(2.0, "--poll-interval", min=0.1, help="Polling interval in seconds"),
+) -> None:
+    from leopard_gecko.tui.app import LeopardGeckoApp
+
+    tui_app = LeopardGeckoApp(data_dir=data_dir, poll_interval=poll_interval)
+    tui_app.run()
 
 
 if __name__ == "__main__":

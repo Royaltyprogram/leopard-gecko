@@ -63,7 +63,7 @@ class AgentTaskNoteGenerator:
 def _task_note_system_prompt() -> str:
     return (
         "You write a short internal routing note for a coding-agent orchestrator. "
-        "Summarize the likely work area and intent in one Korean sentence. "
+        "Summarize the likely work area and intent in one English sentence. "
         "Keep it simple, concrete, and useful for routing only. "
         "Do not rewrite the task as instructions for execution. "
         "Do not use tags, bullet points, or JSON in the note text. "

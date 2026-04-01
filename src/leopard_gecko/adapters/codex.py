@@ -51,7 +51,11 @@ class CodexAdapter(WorkerPort):
         exit_path.unlink(missing_ok=True)
         with stdout_path.open("a", encoding="utf-8") as handle:
             process = subprocess.Popen(
-                self._build_wrapped_command(command=command, exit_path=exit_path),
+                self._build_wrapped_command(
+                    command=command,
+                    exit_path=exit_path,
+                    prompt=user_prompt,
+                ),
                 cwd=str(cwd),
                 stdin=subprocess.DEVNULL,
                 stdout=handle,
@@ -168,26 +172,83 @@ class CodexAdapter(WorkerPort):
         prompt: str,
         worker_context_id: str | None = None,
     ) -> list[str]:
-        command = [self._config.command]
-
         if worker_context_id:
-            command.extend(["exec", "resume", worker_context_id])
-        else:
-            command.append("exec")
+            return self._build_resume_command(
+                cwd=cwd,
+                last_message_path=last_message_path,
+                prompt=prompt,
+                worker_context_id=worker_context_id,
+            )
+        return self._build_exec_command(
+            cwd=cwd,
+            last_message_path=last_message_path,
+            prompt=prompt,
+        )
 
-        command.append("--json")
-        command.extend(["--cd", str(cwd), "--sandbox", self._config.sandbox])
+    def _build_exec_command(
+        self,
+        *,
+        cwd: Path,
+        last_message_path: Path,
+        prompt: str,
+    ) -> list[str]:
+        del prompt
+        command = self._build_exec_base_command(cwd=cwd)
+        command.extend(["--output-last-message", str(last_message_path), "-"])
+        return command
+
+    def _build_resume_command(
+        self,
+        *,
+        cwd: Path,
+        last_message_path: Path,
+        prompt: str,
+        worker_context_id: str,
+    ) -> list[str]:
+        del prompt
+        command = self._build_exec_base_command(cwd=cwd)
+        command.append("resume")
+        command.extend(
+            ["--output-last-message", str(last_message_path), "--", worker_context_id, "-"]
+        )
+        return command
+
+    def _build_exec_base_command(self, *, cwd: Path) -> list[str]:
+        command = [
+            self._config.command,
+            "exec",
+            "--json",
+            "--cd",
+            str(cwd),
+            "--sandbox",
+            self._config.sandbox,
+        ]
+        command.extend(self._config_overrides())
 
         if self._config.profile:
             command.extend(["--profile", self._config.profile])
         if self._config.model:
             command.extend(["--model", self._config.model])
 
-        command.extend(["--output-last-message", str(last_message_path), prompt])
         return command
 
-    def _build_wrapped_command(self, *, command: list[str], exit_path: Path) -> list[str]:
+    def _config_overrides(self) -> list[str]:
+        overrides: list[str] = []
+
+        if self._config.approval_policy:
+            overrides.extend(["-c", f'approval_policy="{self._config.approval_policy}"'])
+
+        return overrides
+
+    def _build_wrapped_command(
+        self,
+        *,
+        command: list[str],
+        exit_path: Path,
+        prompt: str,
+    ) -> list[str]:
         quoted_command = shlex.join(command)
+        quoted_prompt = shlex.quote(prompt)
         python_code = (
             "import json, sys; "
             "from datetime import datetime, timezone; "
@@ -203,7 +264,7 @@ class CodexAdapter(WorkerPort):
         )
         script = "\n".join(
             [
-                quoted_command,
+                f"printf '%s' {quoted_prompt} | {quoted_command}",
                 "exit_code=$?",
                 f"python3 -c {shlex.quote(python_code)} {shlex.quote(str(exit_path))} \"$exit_code\"",
                 'exit "$exit_code"',

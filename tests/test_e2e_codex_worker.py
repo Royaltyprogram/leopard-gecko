@@ -30,7 +30,6 @@ class CreateSessionRouter:
         return RouteDecision(
             action=RouteAction.CREATE_NEW_SESSION,
             reason="force codex worker e2e path",
-            confidence=1.0,
         )
 
 
@@ -87,7 +86,7 @@ def test_real_codex_worker_completes_task(tmp_path) -> None:
 
     assert task.routing.decision is RoutingDecision.CREATED_NEW_SESSION
     assert task.queue_status is QueueStatus.COMPLETED
-    assert session.status is SessionStatus.IDLE
+    assert session.status in {SessionStatus.COOLDOWN, SessionStatus.IDLE}
     assert session.current_task_id is None
     assert session.active_run_id is None
     assert session.active_pid is None

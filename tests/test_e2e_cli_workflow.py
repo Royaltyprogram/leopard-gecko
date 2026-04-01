@@ -32,19 +32,16 @@ def test_cli_full_workflow_exercises_all_commands(monkeypatch, tmp_path) -> None
             return RouteDecision(
                 action=RouteAction.ENQUEUE_GLOBAL,
                 reason="forced global queue for e2e",
-                confidence=0.7,
             )
         if sessions:
             return RouteDecision(
                 action=RouteAction.ASSIGN_EXISTING,
                 session_id=sessions[0].session_id,
                 reason="forced existing session for e2e",
-                confidence=0.9,
             )
         return RouteDecision(
             action=RouteAction.CREATE_NEW_SESSION,
             reason="forced new session for e2e",
-            confidence=0.95,
         )
 
     monkeypatch.setattr(AgentRouter, "decide", fake_decide)

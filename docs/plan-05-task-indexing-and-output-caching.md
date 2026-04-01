@@ -1,56 +1,54 @@
 # Task Indexing And Output Caching Plan
 
-> 목표: task 수와 worker output이 늘어나도 `poll()`과 queue 승격 비용이 선형으로 악화되지 않게 만든다.
+> Goal: Prevent `poll()` and queue promotion costs from degrading linearly as the number of tasks and worker output grows.
 
-## 문제
+## Problem
 
-현재 두 군데가 커질수록 느려진다.
+Currently, two areas get slower as they grow:
 
-1. task 복원
-   `tasks.jsonl` 전체를 읽고 역순 탐색해서 `task_created`를 찾는다.
+1. Task restoration
+   Reads the entire `tasks.jsonl` and searches in reverse order to find `task_created`.
 
-2. worker context 복원
-   run output jsonl 전체를 매 poll마다 끝까지 읽어서 `worker_context_id`를 찾는다.
+2. Worker context restoration
+   Reads the entire run output jsonl to the end on every poll to find the `worker_context_id`.
 
-처음엔 괜찮지만 task 수와 output 크기가 늘면 polling 비용이 급격히 커진다.
+This is fine initially, but as the number of tasks and output size grow, polling costs increase dramatically.
 
-## 목표 상태
+## Target State
 
-- task 복원은 O(1)에 가깝게 처리한다.
-- worker context와 last message는 output 전체 재스캔 없이 읽는다.
-- append-only log는 감사 용도로 유지하되 hot path에서는 직접 읽지 않는다.
+- Task restoration is handled in near-O(1) time.
+- Worker context and last message are read without rescanning the entire output.
+- The append-only log is kept for audit purposes but is not read directly in the hot path.
 
-## 구현 방향
+## Implementation Approach
 
-### 방향 1. task snapshot을 hot path로 사용
+### Approach 1. Use task snapshots as the hot path
 
-`plan-01`에서 추가하는 task snapshot 저장소를 기본 조회 경로로 삼는다.
-이렇게 하면 queue 승격 시 더 이상 `tasks.jsonl` 전체 스캔이 필요 없다.
+Use the task snapshot store added in `plan-01` as the primary lookup path.
+This eliminates the need for a full `tasks.jsonl` scan during queue promotion.
 
-### 방향 2. worker state sidecar 파일 추가
+### Approach 2. Add worker state sidecar files
 
-worker output과 별도로 작은 state 파일을 유지한다.
+Maintain a small state file separate from the worker output.
 
-- 경로 예시: `worker_runs/<session_id>/<task_id>.state.json`
-- 필드:
+- Example path: `worker_runs/<session_id>/<task_id>.state.json`
+- Fields:
   - `worker_context_id`
   - `last_message`
   - `updated_at`
 
-`poll()`은 jsonl 전체를 스캔하지 말고 이 sidecar를 먼저 읽는다.
+`poll()` reads this sidecar first instead of scanning the entire jsonl.
 
-### 방향 3. output parsing 최소화
+### Approach 3. Minimize output parsing
 
-새 이벤트가 append될 때만 incremental 하게 갱신하는 구조가 이상적이다.
-MVP에서는 더 단순하게:
+The ideal structure would update incrementally only when new events are appended.
+For the MVP, start more simply:
 
-- dispatch 시 state 파일 생성
-- poll 시 output 파일 끝부분만 읽거나
-- 종료 시 wrapper가 last message/state 파일을 직접 갱신
+- Create state file on dispatch
+- Read only the tail of the output file on poll, or
+- Have the wrapper directly update the last message/state file on termination
 
-정도로 시작한다.
-
-## 변경 대상
+## Files to Change
 
 - `src/leopard_gecko/orchestrator/pipeline.py`
 - `src/leopard_gecko/adapters/codex.py`
@@ -58,61 +56,61 @@ MVP에서는 더 단순하게:
 - `tests/test_workers.py`
 - `tests/test_pipeline.py`
 
-## 세부 구현 계획
+## Detailed Implementation Plan
 
-### 1. task lookup 경로 교체
+### 1. Replace task lookup path
 
-- `_load_task()`는 snapshot 저장소 사용
-- `tasks.jsonl` 스캔은 fallback 또는 debug only 경로로 축소
+- `_load_task()` uses the snapshot store
+- `tasks.jsonl` scanning is reduced to a fallback or debug-only path
 
-### 2. worker state file 도입
+### 2. Introduce worker state file
 
-`CodexAdapter`가 아래 파일을 관리한다.
+`CodexAdapter` manages the following files:
 
 - `.state.json`
 - `.last_message.txt`
-- 필요 시 `.exit.json`
+- `.exit.json` if needed
 
-`worker_context_id`와 `last_message`는 state file에 한번 정리해서 저장한다.
+`worker_context_id` and `last_message` are consolidated and stored in the state file.
 
-### 3. `poll()` 읽기 순서 최적화
+### 3. Optimize `poll()` read order
 
-`poll()`은 아래 우선순위를 따른다.
+`poll()` follows this priority:
 
 1. state file
 2. last message file
 3. output jsonl fallback
 
-즉 가장 작은 파일부터 읽고, 큰 jsonl은 정말 필요할 때만 본다.
+That is, it reads the smallest files first and only accesses the large jsonl when truly necessary.
 
-### 4. output parsing helper 분리
+### 4. Extract output parsing helper
 
-`codex.py` 안의 파일 읽기 로직을 helper로 분리한다.
+Extract file reading logic from `codex.py` into helpers.
 
 - `load_run_state_files(...)`
 - `parse_output_for_context_id(...)`
 
-이렇게 나누면 테스트와 추후 교체가 쉬워진다.
+This separation makes testing and future replacement easier.
 
-## 테스트 계획
+## Test Plan
 
-- `_load_task()`가 snapshot 경로를 우선 사용하는지 검증
-- state file이 있으면 output jsonl 전체를 읽지 않아도 되는지 검증
-- context id와 last message가 sidecar에서 정상 복원되는지 검증
-- sidecar가 없을 때 기존 fallback 파싱이 동작하는지 검증
+- Verify that `_load_task()` prioritizes the snapshot path
+- Verify that when a state file exists, the entire output jsonl does not need to be read
+- Verify that context id and last message are properly restored from the sidecar
+- Verify that existing fallback parsing works when the sidecar is missing
 
-## 구현 순서
+## Implementation Order
 
-1. task snapshot 저장소를 hot path에 연결
-2. run state sidecar 포맷 정의
-3. `CodexAdapter.poll()` 읽기 순서 최적화
-4. fallback 파싱 helper 분리
-5. 성능 회귀 방지 테스트 추가
+1. Connect task snapshot store to the hot path
+2. Define run state sidecar format
+3. Optimize `CodexAdapter.poll()` read order
+4. Extract fallback parsing helper
+5. Add performance regression prevention tests
 
-## 비목표
+## Non-Goals
 
-- 정밀 벤치마크 프레임워크
-- 대규모 로그 저장소 교체
-- 완전한 streaming parser
+- Precise benchmarking framework
+- Large-scale log store replacement
+- Full streaming parser
 
-지금 단계에서는 "hot path에서 전체 파일 스캔을 피한다"는 목표만 달성하면 된다.
+At this stage, it is sufficient to achieve the goal of "avoiding full file scans in the hot path".

@@ -53,7 +53,6 @@ class AgentRouter(ContextRouter):
                 action=raw_decision["action"],
                 session_id=session_id,
                 reason=raw_decision["reason"],
-                confidence=raw_decision["confidence"],
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RoutingError(f"Agent router returned invalid decision payload: {raw_decision}") from exc
@@ -118,13 +117,8 @@ def _route_decision_schema() -> dict[str, Any]:
                 "reason": {
                     "type": "string",
                 },
-                "confidence": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 1,
-                },
             },
-            "required": ["action", "session_id", "reason", "confidence"],
+            "required": ["action", "session_id", "reason"],
             "additionalProperties": False,
         },
     }

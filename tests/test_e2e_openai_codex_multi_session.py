@@ -63,8 +63,8 @@ def test_real_openai_router_and_multiple_codex_sessions(tmp_path, monkeypatch) -
     orchestrator.config_repo.save(config)
 
     prompts = [
-        "완전히 독립적인 작업이다. 새 세션을 시작해서 정확히 FIRST만 답하고 어떤 파일도 수정하지 말아줘.",
-        "이전 작업과 완전히 unrelated한 다른 작업이다. 별도의 새 세션을 시작해서 정확히 SECOND만 답하고 어떤 파일도 수정하지 말아줘.",
+        "This is a completely independent task. Start a new session and answer exactly FIRST only, without modifying any files.",
+        "This is a completely unrelated task from the previous one. Start a separate new session and answer exactly SECOND only, without modifying any files.",
     ]
 
     first = orchestrator.submit(prompts[0])
@@ -115,7 +115,7 @@ def test_real_openai_router_and_multiple_codex_sessions(tmp_path, monkeypatch) -
         (first_session, first.task_id, "FIRST"),
         (second_session, second.task_id, "SECOND"),
     ):
-        assert session.status is SessionStatus.IDLE
+        assert session.status in {SessionStatus.COOLDOWN, SessionStatus.IDLE}
         assert session.current_task_id is None
         assert session.active_run_id is None
         assert session.active_pid is None

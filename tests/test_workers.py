@@ -3,7 +3,7 @@ import json
 from leopard_gecko.adapters.codex import CodexAdapter
 from leopard_gecko.adapters.factory import build_worker
 from leopard_gecko.adapters.noop import NoopWorkerAdapter
-from leopard_gecko.models.config import AppConfig, WorkerBackend
+from leopard_gecko.models.config import AppConfig, CodexWorkerConfig, WorkerBackend
 
 
 def test_build_worker_uses_configured_backend() -> None:
@@ -32,7 +32,9 @@ def test_codex_adapter_builds_expected_command(tmp_path) -> None:
     assert "--json" in command
     assert "--cd" in command
     assert "--sandbox" in command
-    assert command[-1] == "fix pagination bug"
+    assert command.count("-c") == 1
+    assert 'approval_policy="never"' in command
+    assert command[-1] == "-"
 
 
 def test_codex_adapter_builds_resume_command(tmp_path) -> None:
@@ -45,9 +47,29 @@ def test_codex_adapter_builds_resume_command(tmp_path) -> None:
         worker_context_id="thread_123",
     )
 
-    assert command[:4] == ["codex", "exec", "resume", "thread_123"]
-    assert "--json" in command
-    assert command[-1] == "continue"
+    assert command[:2] == ["codex", "exec"]
+    assert "resume" in command
+    assert "--cd" in command
+    assert "--sandbox" in command
+    assert command.count("-c") == 1
+    assert 'approval_policy="never"' in command
+    assert command.index("resume") > command.index("--sandbox")
+    assert command[-3:] == ["--", "thread_123", "-"]
+
+
+def test_codex_adapter_builds_resume_command_with_profile(tmp_path) -> None:
+    adapter = CodexAdapter(CodexWorkerConfig(profile="test-profile"))
+
+    command = adapter._build_command(
+        cwd=tmp_path,
+        last_message_path=tmp_path / "last.txt",
+        prompt="continue",
+        worker_context_id="thread_123",
+    )
+
+    assert "--profile" in command
+    assert command[command.index("--profile") + 1] == "test-profile"
+    assert command.index("--profile") < command.index("resume")
 
 
 def test_codex_adapter_submit_persists_run_metadata(tmp_path, monkeypatch) -> None:
@@ -81,6 +103,29 @@ def test_codex_adapter_submit_persists_run_metadata(tmp_path, monkeypatch) -> No
     assert payload["cwd"] == str(tmp_path)
     assert payload["output_path"] == submission.output_path
     assert seen["command"][:2] == ["/bin/sh", "-c"]
+    assert "printf '%s' 'recover this run' |" in seen["command"][2]
+
+
+def test_codex_adapter_submit_passes_special_prompt_via_stdin(tmp_path, monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakePopen:
+        def __init__(self, command, **kwargs) -> None:
+            seen["command"] = command
+            self.pid = 4321
+
+    monkeypatch.setattr("leopard_gecko.adapters.codex.subprocess.Popen", FakePopen)
+
+    adapter = CodexAdapter()
+    adapter.submit(
+        "sess_1",
+        "task_1",
+        "-",
+        cwd=tmp_path,
+        data_dir=tmp_path,
+    )
+
+    assert "printf '%s' - |" in seen["command"][2]
 
 
 def test_codex_adapter_poll_prefers_state_sidecar(tmp_path, monkeypatch) -> None:

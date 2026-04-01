@@ -16,3 +16,6 @@ build/
 .venv/
 venv/
 myenv/
+
+
+.leopard-gecko

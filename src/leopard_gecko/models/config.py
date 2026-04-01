@@ -53,6 +53,7 @@ class CodexWorkerConfig(BaseModel):
     approval_policy: str = "never"
     model: str | None = None
     profile: str | None = None
+    completed_session_cooldown_sec: int = Field(default=15, ge=0)
 
 
 class WorkerConfig(BaseModel):

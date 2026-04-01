@@ -1,142 +1,142 @@
-좋아. 지금까지 이야기한 내용을 기준으로, 최종 기획사항을 한 번에 볼 수 있게 정리해줄게.
+Alright. Based on everything we've discussed so far, let me organize the final planning document so you can see it all at once.
 
-1. 제품 정의
+1. Product Definition
 
-이 시스템은 하나의 사용자 인터페이스 뒤에서 여러 코딩 에이전트 terminal session을 관리하는 컨텍스트 라우팅 CLI다.
+This system is a context-routing CLI that manages multiple coding agent terminal sessions behind a single user interface.
 
-사용자는 오직 하나의 에이전트에게만 자연어로 명령한다.
-그러면 상위의 컨텍스트 에이전트가:
-	•	사용자의 명령을 기록하고
-	•	짧은 라우팅용 메모를 남기고
-	•	현재 살아 있는 session들을 확인한 뒤
-	•	가장 적절한 session에 작업을 큐잉하거나
-	•	맞는 session이 없으면 새 terminal session을 만들어 할당한다
+The user gives natural language commands to only one agent.
+Then the upper-level context agent:
+	•	Records the user's command
+	•	Leaves a short routing memo
+	•	Checks the currently alive sessions
+	•	Queues work to the most appropriate session, or
+	•	If no matching session exists, creates a new terminal session and assigns it
 
-핵심 목적은 하나다.
+The core purpose is singular.
 
-서로 관련 없는 작업이 같은 세션에 섞여 들어가면서 생기는 context rot를 줄이고,
-세션을 기능/도메인 단위로 유지하면서 효율적으로 라우팅하는 것.
+Reduce context rot that occurs when unrelated tasks get mixed into the same session,
+and route efficiently while maintaining sessions on a per-feature/domain basis.
 
-⸻
+---
 
-2. 핵심 철학
+2. Core Philosophy
 
-이 시스템은 “작업을 더 잘 구현하는 에이전트”라기보다, 먼저 작업을 적절한 세션에 붙이는 오케스트레이터다.
+This system is not "an agent that implements tasks better," but rather an orchestrator that first assigns tasks to the appropriate session.
 
-중요한 원칙은 아래와 같다.
+The important principles are as follows.
 
-1) 사용자 원문 프롬프트는 그대로 보존
+1) The user's original prompt is preserved as-is
 
-상위 에이전트가 사용자의 말을 재작성해서 실제 코딩 에이전트에 주입하지 않는다.
+The upper-level agent does not rewrite the user's words and inject them into the actual coding agent.
 
-2) task note는 라우팅용 참고 메모일 뿐
+2) task note is merely a reference memo for routing
 
-task note는 구현 지시문이 아니다.
-짧게 1~2줄로 “이 작업이 어느 영역에 가까운지”만 기록한다.
+The task note is not an implementation directive.
+It briefly records in 1-2 lines "which area this task is closest to."
 
-3) task note는 worker session에 넘기지 않음
+3) task note is not passed to the worker session
 
-task note는 컨텍스트 에이전트가 다음 라우팅 때 참고하기 위한 내부 메모다.
-실제 코딩 에이전트에는 user_prompt만 전달한다.
+The task note is an internal memo for the context agent to reference during the next routing.
+Only the user_prompt is delivered to the actual coding agent.
 
-4) sessions.json에는 과거 작업을 계속 누적
+4) sessions.json accumulates past tasks continuously
 
-각 세션이 지금까지 어떤 작업들을 맡아왔는지가 다음 라우팅의 핵심 근거가 된다.
+What tasks each session has handled so far becomes the core basis for the next routing decision.
 
-5) 기존 세션 재사용을 우선하되, context rot 위험이 있으면 분리
+5) Prioritize reusing existing sessions, but separate if there's a risk of context rot
 
-관련성이 높으면 같은 세션에 큐잉하고, 아니면 새 세션을 만든다.
+If relevance is high, queue to the same session; otherwise, create a new session.
 
-⸻
+---
 
-3. 최종 워크플로우
+3. Final Workflow
 
-Step 1. 사용자 명령 입력
+Step 1. User command input
 
-사용자가 하나의 인터페이스에서 자연어로 명령한다.
+The user gives natural language commands from a single interface.
 
-예:
-	•	“관리자 유저 목록에 pagination 붙여줘”
-	•	“auth 에러 처리 세션에 401/403 구분도 추가해줘”
+Examples:
+	•	"Add pagination to the admin user list"
+	•	"Add 401/403 distinction to the auth error handling session"
 
-Step 2. task 생성
+Step 2. Task creation
 
-컨텍스트 에이전트는 이 명령을 기반으로 task를 만든다.
+The context agent creates a task based on this command.
 
-하지만 여기서 하는 일은 refine prompt 생성이 아니다.
-대신 아래 두 가지만 남긴다.
-	•	user_prompt: 사용자의 원문
-	•	task_note: 라우팅용 짧은 메모
+However, what happens here is not refined prompt generation.
+Instead, only these two things are recorded:
+	•	user_prompt: the user's original text
+	•	task_note: a short memo for routing
 
-예:
-	•	“admin/users 영역 확장으로 보임. 관련 세션 있으면 우선 라우팅.”
-	•	“기존 auth 에러 처리 작업과 가까워 보임.”
+Examples:
+	•	"Looks like an expansion of the admin/users area. Route to related session if available."
+	•	"Appears close to the existing auth error handling task."
 
-Step 3. 현재 sessions.json 조회
+Step 3. Query current sessions.json
 
-컨텍스트 에이전트는 현재 살아 있는 terminal session들의 상태와 과거 작업 히스토리를 읽는다.
+The context agent reads the state and past task history of currently alive terminal sessions.
 
-확인 대상:
-	•	현재 상태: idle / busy / blocked / dead
-	•	현재 작업
-	•	큐 길이
-	•	과거 task_history
-	•	최근 이 세션이 맡아온 작업 성격
+What it checks:
+	•	Current status: idle / busy / blocked / dead
+	•	Current task
+	•	Queue length
+	•	Past task_history
+	•	The nature of tasks this session has recently handled
 
-Step 4. 라우팅 판단
+Step 4. Routing decision
 
-새 task를 어느 session에 붙일지 판단한다.
+Determine which session to assign the new task to.
 
-판단 기준:
-	•	새 user_prompt와 기존 session의 과거 작업이 얼마나 문맥적으로 상통되는지
-	•	task_note 기준으로 같은 도메인/기능군인지
-	•	현재 그 session에 큐잉하는 게 자연스러운지
-	•	잘못 붙였을 때 context rot 위험이 큰지
-	•	이미 queue가 너무 길지 않은지
+Decision criteria:
+	•	How contextually aligned the new user_prompt is with the existing session's past tasks
+	•	Whether it belongs to the same domain/feature group based on task_note
+	•	Whether queuing to that session is natural
+	•	Whether the risk of context rot is high if assigned incorrectly
+	•	Whether the queue is already too long
 
-Step 5. 기존 세션이 적절하면 큐잉
+Step 5. Queue to an existing session if appropriate
 
-적절한 session이 있으면:
-	•	idle이면 바로 할당
-	•	busy면 현재 작업이 끝난 뒤 수행되도록 queue에 추가
+If an appropriate session exists:
+	•	If idle, assign immediately
+	•	If busy, add to the queue to be executed after the current task finishes
 
-즉, 기존 작업을 중간에 끊지 않고 순차 처리한다.
+In other words, tasks are processed sequentially without interrupting ongoing work.
 
-Step 6. 적절한 세션이 없으면 새 세션 생성 검토
+Step 6. Review new session creation if no appropriate session exists
 
-관련 세션이 없으면 config에 설정된 max_terminal_num을 본다.
-	•	남는 terminal 수가 있으면 새 session 생성
-	•	이미 한도에 도달했으면 global pending queue에 넣고 대기
+If there's no related session, check the max_terminal_num set in config.
+	•	If there's remaining terminal capacity, create a new session
+	•	If the limit has been reached, put it in the global pending queue and wait
 
-Step 7. worker에는 user_prompt만 전달
+Step 7. Only user_prompt is delivered to the worker
 
-실제 코딩 에이전트 session에는 내부 메모를 주지 않는다.
+Internal memos are not given to the actual coding agent session.
 
-전달되는 것은 기본적으로:
-	•	사용자의 원문 프롬프트
+What is delivered is essentially:
+	•	The user's original prompt
 
-필요시 최소한의 시스템 수준 세션 관리 정보만 별도로 줄 수 있지만,
-라우팅용 task_note는 주입하지 않는다.
+Minimal system-level session management information can be provided separately if needed,
+but the routing task_note is not injected.
 
-Step 8. 작업 완료 후 sessions.json 갱신
+Step 8. Update sessions.json after task completion
 
-task가 끝나면 해당 세션의 task_history에 누적 저장한다.
+When a task finishes, it is accumulated and saved in the session's task_history.
 
-남겨야 할 것:
-	•	어떤 프롬프트였는지
-	•	어떤 task_note였는지
-	•	완료/실패/중단 여부
-	•	필요시 짧은 결과 메모
+What should be recorded:
+	•	What the prompt was
+	•	What the task_note was
+	•	Whether it was completed/failed/aborted
+	•	A short result memo if needed
 
-이 히스토리가 이후 라우팅의 근거가 된다.
+This history becomes the basis for subsequent routing.
 
-⸻
+---
 
-4. task의 최종 개념
+4. Final Concept of a Task
 
-task는 실행 명세가 아니라 라우팅 단위다.
+A task is not an execution specification but a routing unit.
 
-필수 개념은 이 정도다.
+The essential concepts are roughly these:
 	•	task_id
 	•	user_prompt
 	•	task_note
@@ -144,14 +144,14 @@ task는 실행 명세가 아니라 라우팅 단위다.
 	•	queue_status
 	•	created_at
 
-여기서 task_note는 아주 단순해야 한다.
+Here, task_note should be very simple.
 
-예시:
+Example:
 
 {
   "task_id": "task_20260401_014",
-  "user_prompt": "관리자 유저 목록에 pagination 붙여줘",
-  "task_note": "admin/users 쪽 목록 기능 확장으로 보임. 관련 세션이 있으면 우선 라우팅.",
+  "user_prompt": "Add pagination to the admin user list",
+  "task_note": "Looks like an expansion of admin/users list functionality. Route to related session if available.",
   "routing": {
     "assigned_session_id": null,
     "decision": "pending",
@@ -161,19 +161,19 @@ task는 실행 명세가 아니라 라우팅 단위다.
   "created_at": "2026-04-01T10:20:00Z"
 }
 
-중요한 점:
-	•	task_note는 구조화 태그 묶음이 아니다
-	•	intent, domain_tags 같은 복잡한 중간 스키마는 MVP에서 제거
-	•	컨텍스트 에이전트가 한두 줄 메모 남기는 수준으로 유지
+Important points:
+	•	task_note is not a bundle of structured tags
+	•	Complex intermediate schemas like intent, domain_tags are removed from the MVP
+	•	Keep it at the level of the context agent leaving a one or two line memo
 
-⸻
+---
 
-5. sessions.json의 최종 역할
+5. Final Role of sessions.json
 
-sessions.json은 단순 현재 상태 파일이 아니라,
-현재 상태 + 과거 작업 누적 히스토리를 담는 레지스트리다.
+sessions.json is not simply a current state file,
+but a registry that holds current state + accumulated past task history.
 
-세션마다 적어도 아래 정보가 있어야 한다.
+Each session should have at least the following information:
 	•	session_id
 	•	terminal_id
 	•	status
@@ -183,7 +183,7 @@ sessions.json은 단순 현재 상태 파일이 아니라,
 	•	created_at
 	•	last_heartbeat
 
-예시 구조:
+Example structure:
 
 {
   "sessions": [
@@ -196,14 +196,14 @@ sessions.json은 단순 현재 상태 파일이 아니라,
       "task_history": [
         {
           "task_id": "task_20260401_003",
-          "user_prompt": "관리자 유저 테이블에 정렬 기능 붙여줘",
-          "task_note": "admin/users 테이블 관련 작업. 기존 관리자 세션과 잘 맞음.",
+          "user_prompt": "Add sorting functionality to the admin user table",
+          "task_note": "Task related to admin/users table. Fits well with existing admin session.",
           "status": "completed"
         },
         {
           "task_id": "task_20260401_014",
-          "user_prompt": "관리자 유저 목록에 pagination 붙여줘",
-          "task_note": "admin/users 쪽 목록 기능 확장으로 보임. 관련 세션이 있으면 우선 라우팅.",
+          "user_prompt": "Add pagination to the admin user list",
+          "task_note": "Looks like an expansion of admin/users list functionality. Route to related session if available.",
           "status": "running"
         }
       ],
@@ -213,68 +213,68 @@ sessions.json은 단순 현재 상태 파일이 아니라,
   ]
 }
 
-핵심은 이것이다.
+The key point is this.
 
-다음 프롬프트가 들어왔을 때,
-컨텍스트 에이전트는 현재 session 상태와 과거 task_history를 보고
-“이 세션이 원래 어떤 종류의 일들을 해온 세션인지” 판단한다.
+When the next prompt comes in,
+the context agent looks at the current session state and past task_history
+and determines "what kind of tasks this session has originally been handling."
 
-⸻
+---
 
-6. 라우팅 정책
+6. Routing Policy
 
-라우팅은 아래 우선순위로 동작한다.
+Routing operates with the following priority.
 
-1) 기존 세션에 자연스럽게 이어질 수 있는가
+1) Can it naturally continue in an existing session?
 
-예:
-	•	같은 기능군
-	•	같은 하위 도메인
-	•	과거 프롬프트들과 결이 비슷함
-	•	같은 맥락으로 이어 붙였을 때 세션 오염이 적음
+Examples:
+	•	Same feature group
+	•	Same subdomain
+	•	Similar in nature to past prompts
+	•	Low session pollution when appended in the same context
 
-그렇다면 기존 세션으로 보낸다.
+If so, send to the existing session.
 
-2) 기존 세션이 있지만 붙이면 세션이 더러워지는가
+2) An existing session exists, but would attaching to it make the session dirty?
 
-예:
-	•	비슷해 보이지만 실제로는 다른 기능 축
-	•	같은 폴더 근처지만 목적이 다름
-	•	이미 세션이 너무 넓어짐
+Examples:
+	•	Looks similar but is actually a different feature axis
+	•	Near the same folder but with a different purpose
+	•	The session has already become too broad
 
-이 경우는 관련성이 약간 있더라도 새 세션 생성이 더 낫다.
+In this case, creating a new session is better even if there's some relevance.
 
-3) 적절한 세션이 없으면 새 세션 생성
+3) Create a new session if no appropriate session exists
 
-단, max_terminal_num 이하일 때만.
+Only when below max_terminal_num.
 
-4) 새 세션도 못 만들면 글로벌 대기
+4) If a new session can't be created either, wait globally
 
-terminal 한도를 넘었으면 global queue에 넣어 대기한다.
+If the terminal limit is exceeded, put it in the global queue and wait.
 
-⸻
+---
 
-7. 큐 정책
+7. Queue Policy
 
-큐는 두 종류가 필요하다.
+Two types of queues are needed.
 
-세션 내부 큐
+Session-internal queue
 
-이미 특정 session에 배정된 작업들이 대기하는 곳.
+Where tasks already assigned to a specific session wait.
 
-예:
-	•	같은 admin/users 세션에 붙은 후속 명령들
+Examples:
+	•	Follow-up commands attached to the same admin/users session
 
-글로벌 대기 큐
+Global waiting queue
 
-아직 어떤 session에도 못 들어간 작업들.
+Tasks that haven't entered any session yet.
 
-필요한 경우:
-	•	관련 session 없음
-	•	terminal 최대 수 초과
-	•	생성 대기 필요
+Required cases:
+	•	No related session
+	•	Terminal maximum exceeded
+	•	Waiting for creation
 
-즉 상태는 최소 이 정도가 된다.
+So the states are at minimum:
 	•	pending
 	•	queued_in_session
 	•	queued_globally
@@ -282,160 +282,160 @@ terminal 한도를 넘었으면 global queue에 넣어 대기한다.
 	•	completed
 	•	failed
 
-⸻
+---
 
-8. 컨텍스트 에이전트와 worker 에이전트의 역할 분리
+8. Role Separation Between Context Agent and Worker Agent
 
-이 설계에서 두 역할은 명확히 분리된다.
+In this design, the two roles are clearly separated.
 
-컨텍스트 에이전트
-	•	사용자 입력 받기
-	•	task 만들기
-	•	task_note 남기기
-	•	sessions.json 확인
-	•	session 라우팅
-	•	queue 관리
-	•	새 terminal/session 생성 결정
-	•	상태 파일 갱신
+Context Agent
+	•	Receive user input
+	•	Create task
+	•	Leave task_note
+	•	Check sessions.json
+	•	Session routing
+	•	Queue management
+	•	Decide on new terminal/session creation
+	•	Update state files
 
-worker 코딩 에이전트
-	•	배정된 user_prompt 수행
-	•	해당 세션 terminal 안에서 실제 코딩
-	•	결과 반환
-	•	종료 시 결과 상태 반영
+Worker Coding Agent
+	•	Execute the assigned user_prompt
+	•	Actual coding within the assigned session terminal
+	•	Return results
+	•	Reflect result status upon completion
 
-즉:
+In other words:
 
-컨텍스트 에이전트는 배치와 정리 담당
-코딩 에이전트는 실행 담당
+The context agent is in charge of placement and organization
+The coding agent is in charge of execution
 
-⸻
+---
 
-9. 왜 refine prompt를 없앴는가
+9. Why We Removed Refined Prompts
 
-이건 이번 논의에서 중요한 변경사항이었다.
+This was an important change in this discussion.
 
-초기엔 사용자의 입력을 더 명확한 prompt로 다시 써서 task에 넣으려 했지만, 최종적으로는 제외했다.
+Initially, we intended to rewrite the user's input into a clearer prompt and put it into the task, but ultimately it was excluded.
 
-이유는 다음과 같다.
+The reasons are as follows.
 
-1) 라우팅용 문장이 실행용 프롬프트를 오염시킬 수 있음
+1) Routing-oriented phrasing can contaminate the execution prompt
 
-상위 에이전트의 해석이 worker 성능을 떨어뜨릴 수 있다.
+The upper-level agent's interpretation can degrade worker performance.
 
-2) 상위 에이전트는 구현 지시자가 아님
+2) The upper-level agent is not an implementation director
 
-상위 계층의 역할은 “어떻게 구현할지”가 아니라 “어디에 붙일지”다.
+The role of the upper layer is "where to assign" not "how to implement."
 
-3) 사용자 원문 프롬프트를 그대로 쓰는 게 안전
+3) Using the user's original prompt as-is is safer
 
-worker는 사용자의 실제 의도를 직접 받는 편이 낫다.
+It's better for the worker to directly receive the user's actual intent.
 
-그래서 최종 결론은:
+So the final conclusion is:
 
-refined_prompt는 만들지 않는다.
-대신 task_note만 남기고, 그것은 라우팅 참고용으로만 쓴다.
+refined_prompt is not created.
+Instead, only task_note is left, and it is used only for routing reference.
 
-⸻
+---
 
-10. 파일 구성
+10. File Structure
 
-MVP 기준으로 필요한 파일은 아래 정도다.
+For the MVP, the required files are roughly these.
 
 config.json
 
-시스템 설정
+System configuration
 
-예:
+Examples:
 	•	max_terminal_num
 	•	queue_policy
 	•	session_idle_timeout_min
 
 sessions.json
 
-현재 살아 있는 세션 레지스트리 + 과거 작업 히스토리
+Currently alive session registry + past task history
 
-tasks.jsonl 또는 tasks.json
+tasks.jsonl or tasks.json
 
-모든 task 생성/라우팅/상태 변경 이력 저장
+Storage for all task creation/routing/state change history
 
-권장:
-	•	전체 이력은 append-only 로그로 tasks.jsonl
-	•	현재 세션 상태는 sessions.json
+Recommendation:
+	•	Full history as an append-only log in tasks.jsonl
+	•	Current session state in sessions.json
 
-⸻
+---
 
-11. 최소 기능 범위(MVP)
+11. Minimum Feature Scope (MVP)
 
-이번 기획 기준으로 MVP는 아래까지다.
+Based on this planning, the MVP covers the following.
 
-포함
-	•	사용자 명령 입력
-	•	task 생성
-	•	짧은 task_note 생성
-	•	sessions.json 조회
-	•	기존 세션 라우팅
-	•	세션 큐잉
-	•	새 세션 생성
-	•	terminal 최대 수 제한
-	•	sessions.json에 task_history 누적
-	•	worker에는 user_prompt만 전달
+Included
+	•	User command input
+	•	Task creation
+	•	Short task_note generation
+	•	sessions.json query
+	•	Existing session routing
+	•	Session queuing
+	•	New session creation
+	•	Terminal maximum limit
+	•	Accumulating task_history in sessions.json
+	•	Only user_prompt delivered to worker
 
-아직 제외
-	•	복잡한 multi-agent planner
-	•	세션 간 협업 DAG
-	•	자동 PR 생성
-	•	고급 충돌 해결
-	•	장기 기억 최적화
-	•	복잡한 의미 벡터 검색
+Not yet included
+	•	Complex multi-agent planner
+	•	Inter-session collaboration DAG
+	•	Automatic PR creation
+	•	Advanced conflict resolution
+	•	Long-term memory optimization
+	•	Complex semantic vector search
 
-즉 MVP는 얇고 실용적인 세션 라우터다.
+In other words, the MVP is a thin and practical session router.
 
-⸻
+---
 
-12. 예상되는 예외 상황
+12. Expected Edge Cases
 
-최종 설계상 꼭 고려해야 할 예외는 이 정도다.
+The edge cases that must be considered in the final design are roughly these.
 
-1) sessions.json에는 살아있다고 나오는데 실제 terminal이 죽어 있음
+1) sessions.json shows a session as alive, but the actual terminal is dead
 
-heartbeat로 감지해서 dead 처리 필요
+Needs to be detected via heartbeat and marked as dead
 
-2) 관련 session은 있지만 queue가 너무 길다
+2) A related session exists but the queue is too long
 
-관련성만 볼 게 아니라 load도 같이 봐야 함
+Need to look at load as well, not just relevance
 
-3) 비슷해 보여도 붙이면 context rot가 심해짐
+3) Looks similar but attaching would cause severe context rot
 
-단순 키워드 일치보다 “같은 작업 축인지”가 중요
+"Whether it's the same task axis" matters more than simple keyword matching
 
-4) terminal 최대 수 초과
+4) Terminal maximum exceeded
 
-새 session 생성 대신 global queue로 보내야 함
+Must send to global queue instead of creating a new session
 
-5) 사용자의 하나의 명령이 사실 여러 작업일 수 있음
+5) A single user command might actually be multiple tasks
 
-MVP에서는 우선 하나의 task로 처리해도 되지만, 나중엔 분할 가능성 고려 가능
+In the MVP, it's fine to handle as a single task first, but splitting can be considered later
 
-⸻
+---
 
-13. 최종 한 줄 정의
+13. Final One-Line Definition
 
-이제 네 시스템은 이렇게 정의하면 가장 정확하다.
+Now your system is most accurately defined as follows.
 
-사용자의 원문 프롬프트를 그대로 보존한 채, 라우팅용 짧은 task note를 남기고, 세션별 누적 작업 히스토리와 현재 상태를 바탕으로 적절한 terminal session에 작업을 큐잉하거나 새 세션을 생성해 할당하는 CLI 기반 컨텍스트 오케스트레이터
+A CLI-based context orchestrator that preserves the user's original prompt as-is, leaves a short task note for routing, and based on per-session accumulated task history and current state, queues work to the appropriate terminal session or creates a new session to assign it.
 
-⸻
+---
 
-14. 아주 짧게 요약하면
+14. Very Brief Summary
 
-이 시스템은 결국 이렇게 동작한다.
-	1.	사용자가 하나의 에이전트에게 말한다
-	2.	컨텍스트 에이전트가 그 말을 task로 기록하고 짧은 메모를 남긴다
-	3.	기존 세션 히스토리를 보고 어디에 붙일지 판단한다
-	4.	맞는 세션이 있으면 큐잉한다
-	5.	없으면 terminal 여유를 보고 새 세션을 만든다
-	6.	worker에는 원문 프롬프트만 넘긴다
-	7.	작업이 끝나면 그 세션의 작업 히스토리에 계속 누적한다
+This system ultimately works like this.
+	1.	The user speaks to a single agent
+	2.	The context agent records that as a task and leaves a short memo
+	3.	It looks at existing session history to determine where to assign it
+	4.	If there's a matching session, it queues the task
+	5.	If not, it checks terminal availability and creates a new session
+	6.	Only the original prompt is passed to the worker
+	7.	When the task finishes, it continues to accumulate in that session's task history
 
-원하면 다음 단계로 바로 이어서 최소 스키마 초안 (config.json, tasks.jsonl, sessions.json) 형태로 작성해줄게.
+If you want, we can continue to the next step and draft the minimum schemas (config.json, tasks.jsonl, sessions.json) right away.

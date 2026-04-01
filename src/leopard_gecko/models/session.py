@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class SessionStatus(StrEnum):
     IDLE = "idle"
     BUSY = "busy"
+    COOLDOWN = "cooldown"
     BLOCKED = "blocked"
     DEAD = "dead"
 
@@ -33,6 +34,7 @@ class Session(BaseModel):
     session_id: str
     status: SessionStatus = SessionStatus.IDLE
     current_task_id: str | None = None
+    cooldown_until: datetime | None = None
     worker_backend: str | None = None
     worker_context_id: str | None = None
     worktree_path: str | None = None
