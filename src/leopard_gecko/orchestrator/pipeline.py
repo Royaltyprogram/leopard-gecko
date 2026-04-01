@@ -31,6 +31,7 @@ from leopard_gecko.store.paths import DataPaths, resolve_data_paths
 from leopard_gecko.store.sessions_repo import SessionsRepository
 from leopard_gecko.store.task_repo import TaskRepository
 from leopard_gecko.store.tasks_log import TasksLog
+from leopard_gecko.worktree import SessionWorktree, WorktreeManager
 
 
 class SubmissionResult(BaseModel):
@@ -94,6 +95,13 @@ class PolledRun(BaseModel):
 class TaskQueueStatusUpdate(BaseModel):
     task_id: str
     queue_status: QueueStatus
+
+
+class DispatchContext(BaseModel):
+    cwd: Path
+    worker_context_id: str | None = None
+    backend: str
+    worktree: SessionWorktree | None = None
 
 
 class PollMutation(BaseModel):
@@ -895,25 +903,28 @@ class Orchestrator:
             self.router = build_router(config)
         return self.router
 
-    def _dispatch_task(self, *, config: AppConfig, request: DispatchRequest) -> WorkerSubmission:
+    def _dispatch_task(
+        self,
+        *,
+        config: AppConfig,
+        request: DispatchRequest,
+        dispatch_context: DispatchContext,
+    ) -> WorkerSubmission:
         worker = self._resolve_worker(config)
-        session = _find_session(self.sessions_repo.load(), request.session_id)
-        worker_context_id = session.worker_context_id
-        backend = session.worker_backend or self._selected_backend(config).value
 
         submission = worker.submit(
             request.session_id,
             request.task_id,
             request.user_prompt,
-            cwd=self.cwd,
+            cwd=dispatch_context.cwd,
             data_dir=self.paths.root_dir,
-            worker_context_id=worker_context_id,
+            worker_context_id=dispatch_context.worker_context_id,
         )
 
         def persist_submission(state: SessionsState) -> None:
             current_session = _find_session(state, request.session_id)
             now = datetime.now(timezone.utc)
-            current_session.worker_backend = backend
+            current_session.worker_backend = dispatch_context.backend
             if submission.worker_context_id:
                 current_session.worker_context_id = submission.worker_context_id
             current_session.active_run_id = submission.run_id
@@ -946,7 +957,8 @@ class Orchestrator:
                     "session_id": request.session_id,
                     "run_id": submission.run_id,
                     "process_id": submission.process_id,
-                    "worker_context_id": submission.worker_context_id or worker_context_id,
+                    "worker_context_id": submission.worker_context_id or dispatch_context.worker_context_id,
+                    "cwd": str(dispatch_context.cwd),
                     "output_path": submission.output_path,
                 },
             )
@@ -961,17 +973,85 @@ class Orchestrator:
         propagate_error: bool = False,
     ) -> bool:
         self._set_task_queue_status(request.task_id, QueueStatus.RUNNING)
+        dispatch_context: DispatchContext | None = None
         try:
-            self._dispatch_task(config=config, request=request)
+            dispatch_context = self._prepare_dispatch_context(config=config, request=request)
+            self._dispatch_task(
+                config=config,
+                request=request,
+                dispatch_context=dispatch_context,
+            )
         except Exception as exc:
-            self._rollback_failed_dispatch(request=request, error=exc)
+            self._rollback_failed_dispatch(
+                config=config,
+                request=request,
+                error=exc,
+                dispatch_context=dispatch_context,
+            )
             if propagate_error:
                 raise
             return False
         return True
 
-    def _rollback_failed_dispatch(self, *, request: DispatchRequest, error: Exception) -> None:
+    def _prepare_dispatch_context(self, *, config: AppConfig, request: DispatchRequest) -> DispatchContext:
+        session = _find_session(self.sessions_repo.load(), request.session_id)
+        dispatch_context = DispatchContext(
+            cwd=self.cwd,
+            worker_context_id=session.worker_context_id,
+            backend=session.worker_backend or self._selected_backend(config).value,
+        )
+        if not config.worktree.enabled:
+            return dispatch_context
+
+        worktree = self._worktree_manager(config).ensure(
+            session_id=session.session_id,
+            existing_path=session.worktree_path,
+            existing_branch=session.worktree_branch,
+            existing_base_ref=session.worktree_base_ref,
+        )
+        self.sessions_repo.update(
+            lambda state: self._persist_session_worktree(
+                state=state,
+                session_id=session.session_id,
+                worktree=worktree,
+            )
+        )
+        dispatch_context.cwd = Path(worktree.path)
+        dispatch_context.worktree = worktree
+        return dispatch_context
+
+    def _persist_session_worktree(
+        self,
+        *,
+        state: SessionsState,
+        session_id: str,
+        worktree: SessionWorktree,
+    ) -> None:
+        session = _find_session(state, session_id)
+        session.worktree_path = worktree.path
+        session.worktree_branch = worktree.branch
+        session.worktree_base_ref = worktree.base_ref
+
+    def _rollback_failed_dispatch(
+        self,
+        *,
+        config: AppConfig,
+        request: DispatchRequest,
+        error: Exception,
+        dispatch_context: DispatchContext | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc)
+        cleanup_error: str | None = None
+
+        if dispatch_context and dispatch_context.worktree and dispatch_context.worktree.created:
+            try:
+                self._worktree_manager(config).remove(
+                    path=dispatch_context.worktree.path,
+                    branch=dispatch_context.worktree.branch,
+                    remove_branch=dispatch_context.worktree.created_branch,
+                )
+            except Exception as exc:
+                cleanup_error = str(exc)
 
         def mutate(state: SessionsState) -> None:
             state.global_queue = [task_id for task_id in state.global_queue if task_id != request.task_id]
@@ -987,6 +1067,10 @@ class Orchestrator:
             _drop_task_history_entry(session, request.task_id)
             _clear_active_run(session)
             session.last_heartbeat = now
+            if dispatch_context and dispatch_context.worktree and dispatch_context.worktree.created and cleanup_error is None:
+                session.worktree_path = None
+                session.worktree_branch = None
+                session.worktree_base_ref = None
 
             if request.created_session and _session_has_no_work(session):
                 state.sessions = [item for item in state.sessions if item.session_id != session.session_id]
@@ -1005,6 +1089,7 @@ class Orchestrator:
                     "source": request.original_queue_source,
                     "created_session": request.created_session,
                     "error": str(error),
+                    "cleanup_error": cleanup_error,
                 },
             )
         )
@@ -1067,6 +1152,9 @@ class Orchestrator:
 
     def _selected_backend(self, config: AppConfig) -> WorkerBackend:
         return self.worker_backend or config.worker.backend
+
+    def _worktree_manager(self, config: AppConfig) -> WorktreeManager:
+        return WorktreeManager(cwd=self.cwd, config=config.worktree)
 
     def _load_task(self, task_id: str) -> Task:
         if self.task_repo.exists(task_id):

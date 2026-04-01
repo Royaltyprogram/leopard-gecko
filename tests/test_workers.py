@@ -78,6 +78,7 @@ def test_codex_adapter_submit_persists_run_metadata(tmp_path, monkeypatch) -> No
     assert payload["run_id"] == submission.run_id
     assert payload["pid"] == 4321
     assert payload["status"] == "running"
+    assert payload["cwd"] == str(tmp_path)
     assert payload["output_path"] == submission.output_path
     assert seen["command"][:2] == ["/bin/sh", "-c"]
 

@@ -69,6 +69,7 @@ class CodexAdapter(WorkerPort):
                 "pid": process.pid,
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "worker_context_id": worker_context_id,
+                "cwd": str(cwd),
                 "output_path": str(stdout_path),
                 "status": "running",
             },

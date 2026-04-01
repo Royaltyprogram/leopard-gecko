@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
+import subprocess
 
 import pytest
 
@@ -17,6 +18,7 @@ class FakeWorkerAdapter(WorkerPort):
         self.submissions: list[WorkerSubmission] = []
         self.received_context_ids: list[str | None] = []
         self.received_prompts: list[str] = []
+        self.received_cwds: list[Path] = []
         self.poll_states: dict[str, WorkerRunState] = {}
         self.submit_errors: list[Exception] = []
 
@@ -34,6 +36,7 @@ class FakeWorkerAdapter(WorkerPort):
             raise self.submit_errors.pop(0)
         run_id = f"run_{len(self.submissions) + 1}"
         self.received_prompts.append(user_prompt)
+        self.received_cwds.append(cwd)
         submission = WorkerSubmission(
             session_id=session_id,
             task_id=task_id,
@@ -234,8 +237,119 @@ def test_submit_creates_then_reuses_related_session(tmp_path) -> None:
     assert session.worker_context_id == worker.submissions[0].worker_context_id
     assert len(worker.submissions) == 1
     assert worker.received_context_ids == [None]
+    assert worker.received_cwds == [orchestrator.cwd]
     assert _snapshot_status(orchestrator, first.task_id) is QueueStatus.RUNNING
     assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.QUEUED_IN_SESSION
+
+
+def test_submit_uses_session_worktree_when_enabled(tmp_path) -> None:
+    repo_dir = _init_git_repo(tmp_path / "repo")
+    worktree_root = tmp_path / "worktrees"
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        cwd=repo_dir,
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    base_config = orchestrator.init_storage()
+    config = base_config.model_copy(
+        update={
+            "worktree": base_config.worktree.model_copy(
+                update={
+                    "enabled": True,
+                    "root_dir": str(worktree_root),
+                }
+            )
+        }
+    )
+    orchestrator.config_repo.save(config)
+
+    first = orchestrator.submit("admin users pagination 추가해줘")
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert session.session_id == first.assigned_session_id
+    assert session.worktree_path == str(worktree_root / session.session_id)
+    assert session.worktree_branch == f"lg/{session.session_id}"
+    assert session.worktree_base_ref == "main"
+    assert worker.received_cwds == [Path(session.worktree_path)]
+
+
+def test_poll_reuses_same_session_worktree_for_follow_up_dispatch(tmp_path) -> None:
+    repo_dir = _init_git_repo(tmp_path / "repo")
+    worktree_root = tmp_path / "worktrees"
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        cwd=repo_dir,
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    base_config = orchestrator.init_storage()
+    config = base_config.model_copy(
+        update={
+            "worktree": base_config.worktree.model_copy(
+                update={
+                    "enabled": True,
+                    "root_dir": str(worktree_root),
+                }
+            )
+        }
+    )
+    orchestrator.config_repo.save(config)
+
+    first = orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_updated",
+        last_message="done",
+    )
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert first.assigned_session_id == second.assigned_session_id
+    assert poll_result.dispatched == 1
+    assert len(worker.received_cwds) == 2
+    assert worker.received_cwds[0] == Path(session.worktree_path)
+    assert worker.received_cwds[1] == Path(session.worktree_path)
+
+
+def test_submit_dispatch_failure_removes_created_worktree_for_new_session(tmp_path) -> None:
+    repo_dir = _init_git_repo(tmp_path / "repo")
+    worktree_root = tmp_path / "worktrees"
+    worker = FakeWorkerAdapter()
+    worker.fail_next_submit("worker submit blew up")
+    orchestrator = Orchestrator(
+        cwd=repo_dir,
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=FakeRouter(),
+    )
+    base_config = orchestrator.init_storage()
+    config = base_config.model_copy(
+        update={
+            "worktree": base_config.worktree.model_copy(
+                update={
+                    "enabled": True,
+                    "root_dir": str(worktree_root),
+                }
+            )
+        }
+    )
+    orchestrator.config_repo.save(config)
+
+    with pytest.raises(RuntimeError, match="worker submit blew up"):
+        orchestrator.submit("admin users pagination 추가해줘")
+
+    assert orchestrator.load_sessions().sessions == []
+    assert list(worktree_root.glob("*")) == []
 
 
 def test_submit_dispatch_failure_rolls_back_created_session(tmp_path) -> None:
@@ -1221,6 +1335,27 @@ def _history_status(session, task_id: str) -> TaskHistoryStatus:
         if entry.task_id == task_id:
             return entry.status
     raise AssertionError(f"missing history for {task_id}")
+
+
+def _init_git_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-b", "main")
+    _git(path, "config", "user.name", "Test User")
+    _git(path, "config", "user.email", "test@example.com")
+    (path / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(path, "add", "README.md")
+    _git(path, "commit", "-m", "init")
+    return path
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _snapshot_status(orchestrator: Orchestrator, task_id: str) -> QueueStatus:

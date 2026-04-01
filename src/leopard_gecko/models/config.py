@@ -60,12 +60,20 @@ class WorkerConfig(BaseModel):
     codex: CodexWorkerConfig = Field(default_factory=CodexWorkerConfig)
 
 
+class WorktreeConfig(BaseModel):
+    enabled: bool = False
+    root_dir: str | None = None
+    branch_prefix: str = "lg"
+    base_ref: str | None = None
+
+
 class AppConfig(BaseModel):
     max_terminal_num: int = Field(default=4, ge=1)
     session_idle_timeout_min: int = Field(default=30, ge=1)
     queue_policy: QueuePolicy = Field(default_factory=QueuePolicy)
     router: RouterConfig = Field(default_factory=RouterConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
+    worktree: WorktreeConfig = Field(default_factory=WorktreeConfig)
     data_dir: str | None = None
 
     @classmethod

@@ -26,6 +26,8 @@ def test_config_defaults() -> None:
     assert config.router.agent.model == "gpt-5-mini"
     assert config.router.agent.api_key_env_var == "OPENAI_API_KEY"
     assert config.worker.backend is WorkerBackend.NOOP
+    assert config.worktree.enabled is False
+    assert config.worktree.branch_prefix == "lg"
     assert config.data_dir == ".leopard-gecko"
 
 
@@ -47,6 +49,9 @@ def test_session_state_defaults() -> None:
     assert session.current_task_id is None
     assert session.worker_backend is None
     assert session.worker_context_id is None
+    assert session.worktree_path is None
+    assert session.worktree_branch is None
+    assert session.worktree_base_ref is None
     assert session.active_run_id is None
     assert session.active_pid is None
     assert session.active_run_started_at is None
@@ -58,6 +63,9 @@ def test_session_runtime_fields_round_trip() -> None:
         session_id="sess_1",
         worker_backend="codex",
         worker_context_id="thread_123",
+        worktree_path="/tmp/worktrees/sess_1",
+        worktree_branch="lg/sess_1",
+        worktree_base_ref="main",
         active_run_id="run_123",
         active_pid=4321,
         last_run_output_path="/tmp/run.jsonl",
@@ -67,6 +75,9 @@ def test_session_runtime_fields_round_trip() -> None:
 
     assert restored.worker_backend == "codex"
     assert restored.worker_context_id == "thread_123"
+    assert restored.worktree_path == "/tmp/worktrees/sess_1"
+    assert restored.worktree_branch == "lg/sess_1"
+    assert restored.worktree_base_ref == "main"
     assert restored.active_run_id == "run_123"
     assert restored.active_pid == 4321
     assert restored.last_run_output_path == "/tmp/run.jsonl"

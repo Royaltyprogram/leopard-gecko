@@ -35,6 +35,9 @@ class Session(BaseModel):
     current_task_id: str | None = None
     worker_backend: str | None = None
     worker_context_id: str | None = None
+    worktree_path: str | None = None
+    worktree_branch: str | None = None
+    worktree_base_ref: str | None = None
     active_run_id: str | None = None
     active_pid: int | None = None
     active_run_started_at: datetime | None = None
