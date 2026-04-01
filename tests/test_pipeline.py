@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 
@@ -5,8 +6,8 @@ import pytest
 
 from leopard_gecko.adapters.base import WorkerPort, WorkerRunState, WorkerSubmission
 from leopard_gecko.models.config import AppConfig
-from leopard_gecko.models.session import SessionStatus, TaskHistoryStatus
-from leopard_gecko.models.task import QueueStatus, RoutingDecision
+from leopard_gecko.models.session import Session, SessionStatus, TaskHistoryStatus
+from leopard_gecko.models.task import QueueStatus, RoutingDecision, Task
 from leopard_gecko.orchestrator.pipeline import Orchestrator
 from leopard_gecko.router.policy import RouteAction, RouteDecision, RoutingError, SessionSnapshot
 
@@ -17,6 +18,7 @@ class FakeWorkerAdapter(WorkerPort):
         self.received_context_ids: list[str | None] = []
         self.received_prompts: list[str] = []
         self.poll_states: dict[str, WorkerRunState] = {}
+        self.submit_errors: list[Exception] = []
 
     def submit(
         self,
@@ -28,6 +30,8 @@ class FakeWorkerAdapter(WorkerPort):
         data_dir: Path,
         worker_context_id: str | None = None,
     ) -> WorkerSubmission:
+        if self.submit_errors:
+            raise self.submit_errors.pop(0)
         run_id = f"run_{len(self.submissions) + 1}"
         self.received_prompts.append(user_prompt)
         submission = WorkerSubmission(
@@ -71,6 +75,35 @@ class FakeWorkerAdapter(WorkerPort):
             last_message=last_message,
         )
 
+    def fail_next_submit(self, message: str = "submit failed") -> None:
+        self.submit_errors.append(RuntimeError(message))
+
+
+class SelectiveFailWorkerAdapter(FakeWorkerAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_task_ids: set[str] = set()
+
+    def submit(
+        self,
+        session_id: str,
+        task_id: str,
+        user_prompt: str,
+        *,
+        cwd: Path,
+        data_dir: Path,
+        worker_context_id: str | None = None,
+    ) -> WorkerSubmission:
+        if task_id in self.fail_task_ids:
+            raise RuntimeError(f"submit failed for {task_id}")
+        return super().submit(
+            session_id,
+            task_id,
+            user_prompt,
+            cwd=cwd,
+            data_dir=data_dir,
+            worker_context_id=worker_context_id,
+        )
 
 class FakeTaskNotePort:
     kind = "fake-note"
@@ -201,6 +234,78 @@ def test_submit_creates_then_reuses_related_session(tmp_path) -> None:
     assert session.worker_context_id == worker.submissions[0].worker_context_id
     assert len(worker.submissions) == 1
     assert worker.received_context_ids == [None]
+    assert _snapshot_status(orchestrator, first.task_id) is QueueStatus.RUNNING
+    assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.QUEUED_IN_SESSION
+
+
+def test_submit_dispatch_failure_rolls_back_created_session(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    worker.fail_next_submit("worker submit blew up")
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=FakeRouter(),
+    )
+
+    with pytest.raises(RuntimeError, match="worker submit blew up"):
+        orchestrator.submit("admin users pagination 추가해줘")
+
+    sessions_state = orchestrator.load_sessions()
+    task_id = next(iter(orchestrator.paths.tasks_dir.glob("task_*.json"))).stem
+    task = orchestrator.task_repo.load(task_id)
+    failure_event = _latest_event(orchestrator, "task_dispatch_failed", task_id=task_id)
+
+    assert sessions_state.sessions == []
+    assert sessions_state.global_queue == [task_id]
+    assert task.queue_status is QueueStatus.QUEUED_GLOBALLY
+    assert failure_event.payload["session_id"].startswith("sess_")
+    assert failure_event.payload["source"] == "direct"
+    assert failure_event.payload["created_session"] is True
+    assert failure_event.payload["error"] == "worker submit blew up"
+
+
+def test_submit_dispatch_failure_restores_existing_idle_session(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    task_note_port = FakeTaskNotePort()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=task_note_port,
+        router=ScenarioRouter(),
+    )
+
+    first = orchestrator.submit("admin users pagination 추가해줘")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_done",
+        last_message="done",
+    )
+    orchestrator.poll_runs()
+
+    worker.fail_next_submit("idle session submit failed")
+    with pytest.raises(RuntimeError, match="idle session submit failed"):
+        orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+
+    sessions_state = orchestrator.load_sessions()
+    session = sessions_state.sessions[0]
+    queued_task_id = next(task_id for task_id in _task_ids(orchestrator) if task_id != first.task_id)
+    task = orchestrator.task_repo.load(queued_task_id)
+    failure_event = _latest_event(orchestrator, "task_dispatch_failed", task_id=queued_task_id)
+
+    assert session.session_id == first.assigned_session_id
+    assert session.status is SessionStatus.IDLE
+    assert session.current_task_id is None
+    assert session.active_run_id is None
+    assert session.active_pid is None
+    assert session.queue == []
+    assert queued_task_id not in [entry.task_id for entry in session.task_history]
+    assert sessions_state.global_queue == [queued_task_id]
+    assert task.queue_status is QueueStatus.QUEUED_GLOBALLY
+    assert failure_event.payload["source"] == "direct"
+    assert failure_event.payload["created_session"] is False
 
 
 def test_poll_completion_dispatches_next_queued_task(tmp_path) -> None:
@@ -235,6 +340,10 @@ def test_poll_completion_dispatches_next_queued_task(tmp_path) -> None:
     assert worker.received_context_ids == [None, "ctx_updated"]
     assert _history_status(session, first.task_id) is TaskHistoryStatus.COMPLETED
     assert _history_status(session, second.task_id) is TaskHistoryStatus.RUNNING
+    assert _snapshot_status(orchestrator, first.task_id) is QueueStatus.COMPLETED
+    assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.RUNNING
+    assert orchestrator.task_repo.load(first.task_id).queue_status is QueueStatus.COMPLETED
+    assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.RUNNING
 
 
 def test_poll_completion_promotes_session_queue_from_task_snapshot_when_log_is_missing(tmp_path) -> None:
@@ -318,6 +427,47 @@ def test_poll_failure_still_dispatches_next_queued_task(tmp_path) -> None:
     assert worker.received_context_ids == [None, "ctx_failed"]
     assert _history_status(session, first.task_id) is TaskHistoryStatus.FAILED
     assert _history_status(session, second.task_id) is TaskHistoryStatus.RUNNING
+    assert _snapshot_status(orchestrator, first.task_id) is QueueStatus.FAILED
+    assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.RUNNING
+    assert orchestrator.task_repo.load(first.task_id).queue_status is QueueStatus.FAILED
+
+
+def test_poll_completion_rolls_back_failed_session_queue_dispatch(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    task_note_port = FakeTaskNotePort()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=task_note_port,
+        router=ScenarioRouter(),
+    )
+
+    first = orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_done",
+        last_message="done",
+    )
+    worker.fail_next_submit("session promotion submit failed")
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+    failure_event = _latest_event(orchestrator, "task_dispatch_failed", task_id=second.task_id)
+
+    assert poll_result.completed == 1
+    assert poll_result.dispatched == 0
+    assert session.status is SessionStatus.IDLE
+    assert session.current_task_id is None
+    assert session.queue == []
+    assert second.task_id not in [entry.task_id for entry in session.task_history]
+    assert orchestrator.load_sessions().global_queue == [second.task_id]
+    assert orchestrator.task_repo.load(first.task_id).queue_status is QueueStatus.COMPLETED
+    assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.QUEUED_GLOBALLY
+    assert failure_event.payload["source"] == "session"
+    assert failure_event.payload["created_session"] is False
 
 
 def test_poll_running_updates_worker_context(tmp_path) -> None:
@@ -344,6 +494,68 @@ def test_poll_running_updates_worker_context(tmp_path) -> None:
     assert session.current_task_id == first.task_id
     assert session.worker_context_id == "ctx_running"
     assert session.active_run_id == worker.submissions[0].run_id
+
+
+def test_poll_running_does_not_append_heartbeat_events(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+
+    orchestrator.submit("admin users pagination 추가해줘")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=True,
+        worker_context_id="ctx_running",
+    )
+
+    poll_result = orchestrator.poll_runs()
+    events = orchestrator.tasks_log.read_all()
+
+    assert poll_result.running == 1
+    assert all(event.event_type != "session_heartbeat" for event in events)
+
+
+def test_poll_running_batch_writes_sessions_once_for_active_runs(tmp_path, monkeypatch) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=FakeRouter(),
+    )
+
+    for prompt in (
+        "admin users pagination 추가해줘",
+        "payments export 기능 추가해줘",
+        "dashboard filter 고쳐줘",
+    ):
+        orchestrator.submit(prompt)
+
+    for submission in worker.submissions:
+        worker.set_poll_state(
+            submission.run_id,
+            is_running=True,
+            worker_context_id=f"ctx::{submission.run_id}",
+        )
+
+    write_calls = 0
+    original_atomic_write = orchestrator.sessions_repo._atomic_write
+
+    def count_atomic_write(path, payload) -> None:
+        nonlocal write_calls
+        write_calls += 1
+        original_atomic_write(path, payload)
+
+    monkeypatch.setattr(orchestrator.sessions_repo, "_atomic_write", count_atomic_write)
+
+    poll_result = orchestrator.poll_runs()
+
+    assert poll_result.running == 3
+    assert write_calls == 2
 
 
 def test_idle_session_promotes_global_queue(tmp_path) -> None:
@@ -379,6 +591,8 @@ def test_idle_session_promotes_global_queue(tmp_path) -> None:
     assert orchestrator.load_sessions().global_queue == []
     assert worker.received_context_ids == [None, "ctx_done"]
     assert _history_status(session, second.task_id) is TaskHistoryStatus.RUNNING
+    assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.RUNNING
+    assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.RUNNING
 
 
 def test_global_queue_stays_waiting_when_capacity_is_full(tmp_path) -> None:
@@ -452,11 +666,428 @@ def test_dead_session_allows_global_queue_promotion_into_new_session(tmp_path) -
     assert new_session.current_task_id == second.task_id
     assert sessions_state.global_queue == []
     assert _history_status(new_session, second.task_id) is TaskHistoryStatus.RUNNING
+    assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.RUNNING
     assert promotion_event.payload == {
         "session_id": new_session.session_id,
         "source": "global",
         "created_session": True,
     }
+
+
+def test_submit_expires_stale_idle_session_before_routing(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    def seed_stale_idle(state) -> None:
+        state.sessions.append(
+            Session(
+                session_id="sess_stale_idle",
+                status=SessionStatus.IDLE,
+                last_heartbeat=_stale_heartbeat(config.session_idle_timeout_min),
+            )
+        )
+
+    orchestrator.sessions_repo.update(seed_stale_idle)
+
+    result = orchestrator.submit("stale idle session cleanup 확인")
+    sessions_state = orchestrator.load_sessions()
+    stale_session = sessions_state.sessions[0]
+    new_session = sessions_state.sessions[1]
+    expire_event = next(
+        event
+        for event in reversed(orchestrator.tasks_log.read_all())
+        if event.event_type == "session_expired"
+    )
+
+    assert result.routing_decision is RoutingDecision.CREATED_NEW_SESSION
+    assert result.assigned_session_id == new_session.session_id
+    assert stale_session.session_id == "sess_stale_idle"
+    assert stale_session.status is SessionStatus.DEAD
+    assert new_session.current_task_id == result.task_id
+    assert expire_event.payload == {
+        "session_id": "sess_stale_idle",
+        "previous_status": SessionStatus.IDLE.value,
+        "reason": "stale_timeout",
+        "task_ids": [],
+    }
+
+
+def test_poll_expires_stale_blocked_session_and_requeues_current_task(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    submission = orchestrator.submit("manual recovery 이후 stale blocked session")
+
+    def mark_blocked_and_stale(state) -> None:
+        session = state.sessions[0]
+        session.status = SessionStatus.BLOCKED
+        session.last_heartbeat = _stale_heartbeat(config.session_idle_timeout_min)
+        session.active_run_id = None
+        session.active_pid = None
+        session.active_run_started_at = None
+        session.last_run_output_path = None
+
+    orchestrator.sessions_repo.update(mark_blocked_and_stale)
+
+    poll_result = orchestrator.poll_runs()
+    sessions_state = orchestrator.load_sessions()
+    session = sessions_state.sessions[0]
+    replacement_session = sessions_state.sessions[1]
+    requeue_event = next(
+        event
+        for event in reversed(orchestrator.tasks_log.read_all())
+        if event.event_type == "task_requeued_from_dead_session"
+    )
+    task = orchestrator.task_repo.load(submission.task_id)
+
+    assert poll_result.running == 0
+    assert poll_result.completed == 0
+    assert poll_result.failed == 0
+    assert poll_result.dispatched == 1
+    assert session.status is SessionStatus.DEAD
+    assert session.current_task_id is None
+    assert session.active_run_id is None
+    assert session.active_pid is None
+    assert replacement_session.current_task_id == submission.task_id
+    assert sessions_state.global_queue == []
+    assert task.queue_status is QueueStatus.RUNNING
+    assert _history_status(session, submission.task_id) is TaskHistoryStatus.INTERRUPTED
+    assert requeue_event.payload == {
+        "session_id": session.session_id,
+        "previous_status": SessionStatus.BLOCKED.value,
+        "reason": "stale_timeout",
+    }
+
+
+def test_submit_expires_stale_busy_session_without_active_run_and_requeues_all_work(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+
+    first = orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("admin users pagination 버튼 스타일도 맞춰줘")
+
+    def break_busy_session(state) -> None:
+        session = state.sessions[0]
+        session.last_heartbeat = _stale_heartbeat(30)
+        session.active_run_id = None
+        session.active_pid = None
+        session.active_run_started_at = None
+        session.last_run_output_path = None
+
+    orchestrator.sessions_repo.update(break_busy_session)
+
+    third = orchestrator.submit("payments export 기능 추가해줘")
+    sessions_state = orchestrator.load_sessions()
+    session = sessions_state.sessions[0]
+    replacement_session = sessions_state.sessions[1]
+
+    assert session.status is SessionStatus.DEAD
+    assert session.current_task_id is None
+    assert session.queue == []
+    assert session.active_run_id is None
+    assert session.active_pid is None
+    assert third.routing_decision is RoutingDecision.CREATED_NEW_SESSION
+    assert replacement_session.current_task_id == third.task_id
+    assert sessions_state.global_queue[:2] == [first.task_id, second.task_id]
+    assert orchestrator.task_repo.load(first.task_id).queue_status is QueueStatus.QUEUED_GLOBALLY
+    assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.QUEUED_GLOBALLY
+    assert _history_status(session, first.task_id) is TaskHistoryStatus.INTERRUPTED
+    assert _history_status(session, second.task_id) is TaskHistoryStatus.QUEUED
+
+
+def test_poll_recovers_capacity_after_expiring_stale_blocked_session(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    queued_task_id = "task_waiting_global"
+    orchestrator.task_repo.save(
+        Task(
+            task_id=queued_task_id,
+            user_prompt="global queue waiting task",
+            task_note="n::global queue waiting task",
+            queue_status=QueueStatus.QUEUED_GLOBALLY,
+        )
+    )
+
+    def seed_state(state) -> None:
+        state.sessions.append(
+            Session(
+                session_id="sess_stale_blocked",
+                status=SessionStatus.BLOCKED,
+                last_heartbeat=_stale_heartbeat(config.session_idle_timeout_min),
+            )
+        )
+        state.global_queue.append(queued_task_id)
+
+    orchestrator.sessions_repo.update(seed_state)
+
+    poll_result = orchestrator.poll_runs()
+    sessions_state = orchestrator.load_sessions()
+    stale_session = sessions_state.sessions[0]
+    new_session = sessions_state.sessions[1]
+
+    assert poll_result.dispatched == 1
+    assert stale_session.status is SessionStatus.DEAD
+    assert new_session.current_task_id == queued_task_id
+    assert sessions_state.global_queue == []
+    assert orchestrator.task_repo.load(queued_task_id).queue_status is QueueStatus.RUNNING
+    assert worker.submissions[-1].task_id == queued_task_id
+
+
+def test_poll_runs_auto_promotes_global_queue_with_no_active_runs_into_idle_session(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    first = orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("payments export 기능 추가해줘")
+
+    def make_idle(state) -> None:
+        session = state.sessions[0]
+        session.status = SessionStatus.IDLE
+        session.current_task_id = None
+        session.active_run_id = None
+        session.active_pid = None
+        session.active_run_started_at = None
+        session.last_run_output_path = None
+
+    orchestrator.sessions_repo.update(make_idle)
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert first.task_id != second.task_id
+    assert poll_result.running == 0
+    assert poll_result.completed == 0
+    assert poll_result.failed == 0
+    assert poll_result.dispatched == 1
+    assert session.status is SessionStatus.BUSY
+    assert session.current_task_id == second.task_id
+    assert orchestrator.load_sessions().global_queue == []
+    assert worker.submissions[1].task_id == second.task_id
+
+
+def test_poll_runs_auto_promotes_global_queue_with_no_active_runs_into_new_session(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    initial_config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(initial_config)
+
+    orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("payments export 기능 추가해줘")
+    next_config = initial_config.model_copy(update={"max_terminal_num": 2})
+    orchestrator.config_repo.save(next_config)
+
+    def make_dead(state) -> None:
+        session = state.sessions[0]
+        session.status = SessionStatus.DEAD
+        session.current_task_id = None
+        session.active_run_id = None
+        session.active_pid = None
+        session.active_run_started_at = None
+        session.last_run_output_path = None
+
+    orchestrator.sessions_repo.update(make_dead)
+
+    poll_result = orchestrator.poll_runs()
+    sessions_state = orchestrator.load_sessions()
+
+    assert poll_result.dispatched == 1
+    assert len(sessions_state.sessions) == 2
+    assert sessions_state.sessions[0].status is SessionStatus.DEAD
+    assert sessions_state.sessions[1].status is SessionStatus.BUSY
+    assert sessions_state.sessions[1].current_task_id == second.task_id
+    assert sessions_state.global_queue == []
+    assert worker.submissions[1].task_id == second.task_id
+
+
+def test_poll_runs_leaves_global_queue_waiting_when_no_active_runs_and_capacity_is_full(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    first = orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("payments export 기능 추가해줘")
+
+    def make_blocked(state) -> None:
+        session = state.sessions[0]
+        session.status = SessionStatus.BLOCKED
+        session.current_task_id = first.task_id
+        session.active_run_id = None
+        session.active_pid = None
+        session.active_run_started_at = None
+        session.last_run_output_path = None
+
+    orchestrator.sessions_repo.update(make_blocked)
+
+    poll_result = orchestrator.poll_runs()
+    sessions_state = orchestrator.load_sessions()
+
+    assert poll_result.dispatched == 0
+    assert len(worker.submissions) == 1
+    assert sessions_state.sessions[0].status is SessionStatus.BLOCKED
+    assert sessions_state.global_queue == [second.task_id]
+
+
+def test_poll_runs_bulk_promotes_global_queue_up_to_idle_and_remaining_capacity(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    initial_config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(initial_config)
+
+    orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("payments export 기능 추가해줘")
+    third = orchestrator.submit("analytics export 기능 추가해줘")
+    next_config = initial_config.model_copy(update={"max_terminal_num": 2})
+    orchestrator.config_repo.save(next_config)
+
+    def make_idle(state) -> None:
+        session = state.sessions[0]
+        session.status = SessionStatus.IDLE
+        session.current_task_id = None
+        session.active_run_id = None
+        session.active_pid = None
+        session.active_run_started_at = None
+        session.last_run_output_path = None
+
+    orchestrator.sessions_repo.update(make_idle)
+
+    poll_result = orchestrator.poll_runs()
+    sessions_state = orchestrator.load_sessions()
+
+    assert poll_result.dispatched == 2
+    assert len(worker.submissions) == 3
+    assert worker.submissions[1].task_id == second.task_id
+    assert worker.submissions[2].task_id == third.task_id
+    assert sessions_state.global_queue == []
+    assert len(sessions_state.sessions) == 2
+    assert sessions_state.sessions[0].current_task_id == second.task_id
+    assert sessions_state.sessions[1].current_task_id == third.task_id
+
+
+def test_poll_runs_stops_bulk_global_promotion_after_first_dispatch_failure(tmp_path) -> None:
+    worker = SelectiveFailWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    initial_config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(initial_config)
+
+    orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("payments export 기능 추가해줘")
+    third = orchestrator.submit("analytics export 기능 추가해줘")
+    next_config = initial_config.model_copy(update={"max_terminal_num": 2})
+    orchestrator.config_repo.save(next_config)
+    worker.fail_task_ids.add(second.task_id)
+
+    def make_idle(state) -> None:
+        session = state.sessions[0]
+        session.status = SessionStatus.IDLE
+        session.current_task_id = None
+        session.active_run_id = None
+        session.active_pid = None
+        session.active_run_started_at = None
+        session.last_run_output_path = None
+
+    orchestrator.sessions_repo.update(make_idle)
+
+    poll_result = orchestrator.poll_runs()
+    sessions_state = orchestrator.load_sessions()
+
+    assert poll_result.dispatched == 0
+    assert len(worker.submissions) == 1
+    assert sessions_state.sessions[0].status is SessionStatus.IDLE
+    assert sessions_state.sessions[0].current_task_id is None
+    assert sessions_state.global_queue == [second.task_id, third.task_id]
+
+
+def test_global_queue_dispatch_failure_restores_front_of_queue(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    task_note_port = FakeTaskNotePort()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=task_note_port,
+        router=ScenarioRouter(),
+    )
+    config = AppConfig.default(str(tmp_path / ".leopard-gecko")).model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    orchestrator.submit("admin users pagination 추가해줘")
+    second = orchestrator.submit("payments export 기능 추가해줘")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_done",
+        last_message="done",
+    )
+    worker.fail_next_submit("global promotion submit failed")
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+    failure_event = _latest_event(orchestrator, "task_dispatch_failed", task_id=second.task_id)
+
+    assert poll_result.completed == 1
+    assert poll_result.dispatched == 0
+    assert session.status is SessionStatus.IDLE
+    assert session.current_task_id is None
+    assert second.task_id not in [entry.task_id for entry in session.task_history]
+    assert orchestrator.load_sessions().global_queue == [second.task_id]
+    assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.QUEUED_GLOBALLY
+    assert failure_event.payload["source"] == "global"
+    assert failure_event.payload["created_session"] is False
 
 
 def test_submit_persists_task_before_sessions_mutation(tmp_path, monkeypatch) -> None:
@@ -579,7 +1210,6 @@ def test_submit_raises_when_default_task_note_generator_cannot_run(tmp_path, mon
     orchestrator = Orchestrator(
         data_dir=str(tmp_path / ".leopard-gecko"),
         worker=worker,
-        router=FakeRouter(),
     )
 
     with pytest.raises(RoutingError, match="Missing OpenAI API key"):
@@ -593,5 +1223,24 @@ def _history_status(session, task_id: str) -> TaskHistoryStatus:
     raise AssertionError(f"missing history for {task_id}")
 
 
+def _snapshot_status(orchestrator: Orchestrator, task_id: str) -> QueueStatus:
+    return orchestrator.task_repo.load(task_id).queue_status
+
+
 def _tokens(text: str) -> set[str]:
     return {token.lower() for token in re.findall(r"[\w-]{2,}", text)}
+
+
+def _stale_heartbeat(timeout_min: int) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(minutes=timeout_min + 1)
+
+
+def _task_ids(orchestrator: Orchestrator) -> list[str]:
+    return sorted(path.stem for path in orchestrator.paths.tasks_dir.glob("task_*.json"))
+
+
+def _latest_event(orchestrator: Orchestrator, event_type: str, *, task_id: str):
+    for event in reversed(orchestrator.tasks_log.read_all()):
+        if event.event_type == event_type and event.task_id == task_id:
+            return event
+    raise AssertionError(f"missing event {event_type} for {task_id}")

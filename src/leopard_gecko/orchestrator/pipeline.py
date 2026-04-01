@@ -1,8 +1,8 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from secrets import token_hex
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from leopard_gecko.adapters.base import WorkerPort, WorkerRunState, WorkerSubmission
 from leopard_gecko.adapters.factory import build_worker
@@ -46,13 +46,25 @@ class DispatchRequest(BaseModel):
     session_id: str
     task_id: str
     user_prompt: str
+    original_queue_source: str = "direct"
     promoted_from_queue: str | None = None
     created_session: bool = False
+
+
+class ExpiredSession(BaseModel):
+    session_id: str
+    previous_status: SessionStatus
+    requeued_task_ids: list[str] = Field(default_factory=list)
+
+
+class ExpireResult(BaseModel):
+    expired_sessions: list[ExpiredSession] = Field(default_factory=list)
 
 
 class SubmissionMutation(BaseModel):
     result: SubmissionResult
     dispatch_request: DispatchRequest | None = None
+    expire_result: ExpireResult = Field(default_factory=ExpireResult)
 
 
 class ActiveRun(BaseModel):
@@ -65,7 +77,6 @@ class ActiveRun(BaseModel):
 
 class TransitionResult(BaseModel):
     next_dispatch: DispatchRequest | None = None
-    should_promote_global: bool = False
 
 
 class PollRunsResult(BaseModel):
@@ -73,6 +84,23 @@ class PollRunsResult(BaseModel):
     completed: int = 0
     failed: int = 0
     dispatched: int = 0
+
+
+class PolledRun(BaseModel):
+    active_run: ActiveRun
+    run_state: WorkerRunState
+
+
+class TaskQueueStatusUpdate(BaseModel):
+    task_id: str
+    queue_status: QueueStatus
+
+
+class PollMutation(BaseModel):
+    poll_result: PollRunsResult = Field(default_factory=PollRunsResult)
+    dispatch_requests: list[DispatchRequest] = Field(default_factory=list)
+    task_events: list[TaskEvent] = Field(default_factory=list)
+    task_status_updates: list[TaskQueueStatusUpdate] = Field(default_factory=list)
 
 
 class Orchestrator:
@@ -135,7 +163,12 @@ class Orchestrator:
         mutation = self.sessions_repo.update(
             lambda state: self._apply_submission(state=state, task=task, config=config)
         )
-        self.task_repo.save(task)
+        self._persist_expire_result(mutation.expire_result)
+        self._update_task_snapshot(
+            task.task_id,
+            queue_status=task.queue_status,
+            routing=task.routing,
+        )
         self.tasks_log.append(
             TaskEvent(
                 event_type="task_routed",
@@ -150,98 +183,61 @@ class Orchestrator:
         )
 
         if mutation.dispatch_request is not None:
-            self._dispatch_task(config=config, request=mutation.dispatch_request)
+            self._dispatch_with_rollback(
+                config=config,
+                request=mutation.dispatch_request,
+                propagate_error=True,
+            )
 
         return mutation.result
 
     def poll_runs(self) -> PollRunsResult:
         config = self.init_storage()
         worker = self._resolve_worker(config)
-        poll_result = PollRunsResult()
+        now = datetime.now(timezone.utc)
+        expire_result = self._expire_stale_sessions_in_repo(config=config, now=now)
+        self._persist_expire_result(expire_result)
+        snapshot = self.sessions_repo.load_snapshot()
+        polled_runs: list[PolledRun] = []
 
-        for active_run in self._collect_active_runs():
-            run_state = worker.poll(
-                run_id=active_run.run_id,
-                process_id=active_run.process_id,
-                output_path=active_run.output_path,
-            )
-            if run_state.is_running:
-                updated = self.sessions_repo.update(
-                    lambda state: self._refresh_running_session(
-                        state=state,
-                        active_run=active_run,
-                        run_state=run_state,
-                    )
-                )
-                if updated:
-                    poll_result.running += 1
-                    self.tasks_log.append(
-                        TaskEvent(
-                            event_type="session_heartbeat",
-                            task_id=active_run.task_id,
-                            payload={
-                                "session_id": active_run.session_id,
-                                "run_id": active_run.run_id,
-                            },
-                        )
-                    )
-                continue
-
-            if run_state.requires_manual_recovery:
-                blocked = self.sessions_repo.update(
-                    lambda state: self._block_run(
-                        state=state,
-                        active_run=active_run,
-                        run_state=run_state,
-                    )
-                )
-                if blocked:
-                    self.tasks_log.append(
-                        TaskEvent(
-                            event_type="task_blocked",
-                            task_id=active_run.task_id,
-                            payload={
-                                "session_id": active_run.session_id,
-                                "run_id": active_run.run_id,
-                                "summary": run_state.last_message,
-                                "reason": run_state.recovery_reason,
-                            },
-                        )
-                    )
-                continue
-
-            transition = self.sessions_repo.update(
-                lambda state: self._finalize_run(
-                    state=state,
+        for active_run in self._collect_active_runs(snapshot.state):
+            polled_runs.append(
+                PolledRun(
                     active_run=active_run,
-                    run_state=run_state,
-                )
-            )
-            event_type = "task_completed" if run_state.exit_code == 0 else "task_failed"
-            if run_state.exit_code == 0:
-                poll_result.completed += 1
-            else:
-                poll_result.failed += 1
-            self.tasks_log.append(
-                TaskEvent(
-                    event_type=event_type,
-                    task_id=active_run.task_id,
-                    payload={
-                        "session_id": active_run.session_id,
-                        "run_id": active_run.run_id,
-                        "exit_code": run_state.exit_code,
-                        "summary": run_state.last_message,
-                    },
+                    run_state=worker.poll(
+                        run_id=active_run.run_id,
+                        process_id=active_run.process_id,
+                        output_path=active_run.output_path,
+                    ),
                 )
             )
 
-            if transition.next_dispatch is not None:
-                self._dispatch_task(config=config, request=transition.next_dispatch)
-                poll_result.dispatched += 1
-            elif transition.should_promote_global and self._promote_next_global_task(config):
-                poll_result.dispatched += 1
+        mutation = self.sessions_repo.update_from_snapshot(
+            snapshot,
+            lambda state: self._apply_polled_runs(
+                state=state,
+                config=config,
+                polled_runs=polled_runs,
+            ),
+        )
 
-        return poll_result
+        for status_update in mutation.task_status_updates:
+            self._set_task_queue_status(status_update.task_id, status_update.queue_status)
+
+        for event in mutation.task_events:
+            self.tasks_log.append(event)
+
+        for index, request in enumerate(mutation.dispatch_requests):
+            if self._dispatch_with_rollback(config=config, request=request):
+                mutation.poll_result.dispatched += 1
+                continue
+            self._restore_reserved_dispatch_requests(
+                failed_request=request,
+                requests=mutation.dispatch_requests[index + 1 :],
+            )
+            break
+
+        return mutation.poll_result
 
     def _apply_submission(
         self,
@@ -250,6 +246,12 @@ class Orchestrator:
         task: Task,
         config: AppConfig,
     ) -> SubmissionMutation:
+        now = datetime.now(timezone.utc)
+        expire_result = self._expire_stale_sessions(
+            state=state,
+            config=config,
+            now=now,
+        )
         router = self._resolve_router(config)
         snapshots = build_session_snapshots(
             state.sessions,
@@ -266,7 +268,6 @@ class Orchestrator:
             config=config,
             sessions=snapshots,
         )
-        now = datetime.now(timezone.utc)
 
         created_session = False
         dispatch_request: DispatchRequest | None = None
@@ -333,10 +334,127 @@ class Orchestrator:
         return SubmissionMutation(
             result=result,
             dispatch_request=dispatch_request,
+            expire_result=expire_result,
         )
 
-    def _collect_active_runs(self) -> list[ActiveRun]:
-        state = self.sessions_repo.load()
+    def _expire_stale_sessions(
+        self,
+        *,
+        state: SessionsState,
+        config: AppConfig,
+        now: datetime,
+    ) -> ExpireResult:
+        timeout = timedelta(minutes=config.session_idle_timeout_min)
+        result = ExpireResult()
+
+        for session in state.sessions:
+            if session.status is SessionStatus.DEAD:
+                continue
+            if now - session.last_heartbeat <= timeout:
+                continue
+            if session.status is SessionStatus.BUSY and _session_has_active_run(session):
+                continue
+
+            previous_status = session.status
+            requeued_task_ids = self._requeue_dead_session_tasks(
+                session=session,
+                state=state,
+                now=now,
+            )
+            session.status = SessionStatus.DEAD
+            result.expired_sessions.append(
+                ExpiredSession(
+                    session_id=session.session_id,
+                    previous_status=previous_status,
+                    requeued_task_ids=requeued_task_ids,
+                )
+            )
+
+        return result
+
+    def _expire_stale_sessions_in_repo(
+        self,
+        *,
+        config: AppConfig,
+        now: datetime,
+    ) -> ExpireResult:
+        snapshot = self.sessions_repo.load_snapshot()
+        preview_state = snapshot.state.model_copy(deep=True)
+        preview_result = self._expire_stale_sessions(
+            state=preview_state,
+            config=config,
+            now=now,
+        )
+        if not preview_result.expired_sessions:
+            return preview_result
+
+        return self.sessions_repo.update_from_snapshot(
+            snapshot,
+            lambda state: self._expire_stale_sessions(
+                state=state,
+                config=config,
+                now=now,
+            ),
+        )
+
+    def _persist_expire_result(self, expire_result: ExpireResult) -> None:
+        for expired_session in expire_result.expired_sessions:
+            self.tasks_log.append(
+                TaskEvent(
+                    event_type="session_expired",
+                    task_id=expired_session.requeued_task_ids[0]
+                    if expired_session.requeued_task_ids
+                    else "",
+                    payload={
+                        "session_id": expired_session.session_id,
+                        "previous_status": expired_session.previous_status,
+                        "reason": "stale_timeout",
+                        "task_ids": expired_session.requeued_task_ids,
+                    },
+                )
+            )
+
+            for task_id in expired_session.requeued_task_ids:
+                self._set_task_queue_status(task_id, QueueStatus.QUEUED_GLOBALLY)
+                self.tasks_log.append(
+                    TaskEvent(
+                        event_type="task_requeued_from_dead_session",
+                        task_id=task_id,
+                        payload={
+                            "session_id": expired_session.session_id,
+                            "previous_status": expired_session.previous_status,
+                            "reason": "stale_timeout",
+                        },
+                    )
+                )
+
+    def _requeue_dead_session_tasks(
+        self,
+        *,
+        session: Session,
+        state: SessionsState,
+        now: datetime,
+    ) -> list[str]:
+        task_ids: list[str] = []
+
+        if session.current_task_id is not None:
+            task_ids.append(session.current_task_id)
+            history_entry = _find_history_entry(session, session.current_task_id)
+            if history_entry.status is TaskHistoryStatus.RUNNING:
+                history_entry.status = TaskHistoryStatus.INTERRUPTED
+                history_entry.summary = history_entry.summary or "stale session expired"
+                history_entry.updated_at = now
+
+        task_ids.extend(session.queue)
+        if task_ids:
+            state.global_queue = task_ids + state.global_queue
+
+        session.current_task_id = None
+        session.queue.clear()
+        _clear_active_run(session)
+        return task_ids
+
+    def _collect_active_runs(self, state: SessionsState) -> list[ActiveRun]:
         active_runs: list[ActiveRun] = []
 
         for session in state.sessions:
@@ -357,6 +475,121 @@ class Orchestrator:
             )
 
         return active_runs
+
+    def _apply_polled_runs(
+        self,
+        *,
+        state: SessionsState,
+        config: AppConfig,
+        polled_runs: list[PolledRun],
+    ) -> PollMutation:
+        mutation = PollMutation()
+
+        for polled_run in polled_runs:
+            active_run = polled_run.active_run
+            run_state = polled_run.run_state
+
+            if run_state.is_running:
+                updated = self._refresh_running_session(
+                    state=state,
+                    active_run=active_run,
+                    run_state=run_state,
+                )
+                if updated:
+                    mutation.poll_result.running += 1
+                continue
+
+            if run_state.requires_manual_recovery:
+                blocked = self._block_run(
+                    state=state,
+                    active_run=active_run,
+                    run_state=run_state,
+                )
+                if blocked:
+                    mutation.task_status_updates.append(
+                        TaskQueueStatusUpdate(
+                            task_id=active_run.task_id,
+                            queue_status=QueueStatus.FAILED,
+                        )
+                    )
+                    mutation.task_events.append(
+                        TaskEvent(
+                            event_type="task_blocked",
+                            task_id=active_run.task_id,
+                            payload={
+                                "session_id": active_run.session_id,
+                                "run_id": active_run.run_id,
+                                "summary": run_state.last_message,
+                                "reason": run_state.recovery_reason,
+                            },
+                        )
+                    )
+                continue
+
+            transition = self._finalize_run(
+                state=state,
+                active_run=active_run,
+                run_state=run_state,
+            )
+            if run_state.exit_code == 0:
+                mutation.poll_result.completed += 1
+                mutation.task_status_updates.append(
+                    TaskQueueStatusUpdate(
+                        task_id=active_run.task_id,
+                        queue_status=QueueStatus.COMPLETED,
+                    )
+                )
+                event_type = "task_completed"
+            else:
+                mutation.poll_result.failed += 1
+                mutation.task_status_updates.append(
+                    TaskQueueStatusUpdate(
+                        task_id=active_run.task_id,
+                        queue_status=QueueStatus.FAILED,
+                    )
+                )
+                event_type = "task_failed"
+
+            mutation.task_events.append(
+                TaskEvent(
+                    event_type=event_type,
+                    task_id=active_run.task_id,
+                    payload={
+                        "session_id": active_run.session_id,
+                        "run_id": active_run.run_id,
+                        "exit_code": run_state.exit_code,
+                        "summary": run_state.last_message,
+                    },
+                )
+            )
+
+            if transition.next_dispatch is not None:
+                mutation.dispatch_requests.append(transition.next_dispatch)
+
+        mutation.dispatch_requests.extend(self._reserve_dispatchable_global_tasks(state=state, config=config))
+        return mutation
+
+    def _reserve_dispatchable_global_tasks(
+        self,
+        *,
+        state: SessionsState,
+        config: AppConfig,
+        excluded_task_ids: set[str] | None = None,
+    ) -> list[DispatchRequest]:
+        requests: list[DispatchRequest] = []
+        dispatch_limit = self._global_promotion_dispatch_limit_for_state(state, config)
+
+        while len(requests) < dispatch_limit:
+            request = self._reserve_global_dispatch(
+                state=state,
+                config=config,
+                excluded_task_ids=excluded_task_ids,
+            )
+            if request is None:
+                break
+            requests.append(request)
+
+        return requests
 
     def _refresh_running_session(
         self,
@@ -484,32 +717,79 @@ class Orchestrator:
                     session_id=session.session_id,
                     task_id=next_task.task_id,
                     user_prompt=next_task.user_prompt,
+                    original_queue_source="session",
                     promoted_from_queue="session",
                 )
             else:
                 session.status = SessionStatus.IDLE
 
-        return TransitionResult(
-            next_dispatch=next_dispatch,
-            should_promote_global=next_dispatch is None and session.status is SessionStatus.IDLE,
-        )
+        return TransitionResult(next_dispatch=next_dispatch)
 
-    def _promote_next_global_task(self, config: AppConfig) -> bool:
+    def _promote_next_global_task(
+        self,
+        config: AppConfig,
+        *,
+        excluded_task_ids: set[str] | None = None,
+    ) -> bool:
         request = self.sessions_repo.update(
-            lambda state: self._reserve_global_dispatch(state=state, config=config)
+            lambda state: self._reserve_global_dispatch(
+                state=state,
+                config=config,
+                excluded_task_ids=excluded_task_ids,
+            )
         )
         if request is None:
             return False
-        self._dispatch_task(config=config, request=request)
-        return True
+        return self._dispatch_with_rollback(config=config, request=request)
+
+    def _promote_dispatchable_global_tasks(
+        self,
+        config: AppConfig,
+        *,
+        excluded_task_ids: set[str] | None = None,
+    ) -> int:
+        requests = self.sessions_repo.update(
+            lambda state: self._reserve_dispatchable_global_tasks(
+                state=state,
+                config=config,
+                excluded_task_ids=excluded_task_ids,
+            )
+        )
+        dispatched = 0
+        for request in requests:
+            if self._dispatch_with_rollback(config=config, request=request):
+                dispatched += 1
+        return dispatched
+
+    def _global_promotion_dispatch_limit(self, config: AppConfig) -> int:
+        state = self.sessions_repo.load()
+        return self._global_promotion_dispatch_limit_for_state(state, config)
+
+    def _global_promotion_dispatch_limit_for_state(
+        self,
+        state: SessionsState,
+        config: AppConfig,
+    ) -> int:
+        idle_sessions = sum(
+            1
+            for session in state.sessions
+            if session.status is SessionStatus.IDLE and session.current_task_id is None
+        )
+        remaining_capacity = max(config.max_terminal_num - live_session_count(state.sessions), 0)
+        return idle_sessions + remaining_capacity
 
     def _reserve_global_dispatch(
         self,
         *,
         state: SessionsState,
         config: AppConfig,
+        excluded_task_ids: set[str] | None = None,
     ) -> DispatchRequest | None:
         if not state.global_queue:
+            return None
+
+        task_id = state.global_queue[0]
+        if excluded_task_ids and task_id in excluded_task_ids:
             return None
 
         idle_session = next(
@@ -520,7 +800,6 @@ class Orchestrator:
             ),
             None,
         )
-        task_id = state.global_queue[0]
         task = self._load_task(task_id)
         if idle_session is not None:
             state.global_queue.pop(0)
@@ -564,6 +843,7 @@ class Orchestrator:
             session_id=session.session_id,
             task_id=task.task_id,
             user_prompt=task.user_prompt,
+            original_queue_source=promoted_from_queue or "direct",
             promoted_from_queue=promoted_from_queue,
         )
 
@@ -595,6 +875,7 @@ class Orchestrator:
             session_id=session.session_id,
             task_id=task.task_id,
             user_prompt=task.user_prompt,
+            original_queue_source=promoted_from_queue or "direct",
             promoted_from_queue=promoted_from_queue,
             created_session=True,
         )
@@ -672,6 +953,118 @@ class Orchestrator:
         )
         return submission
 
+    def _dispatch_with_rollback(
+        self,
+        *,
+        config: AppConfig,
+        request: DispatchRequest,
+        propagate_error: bool = False,
+    ) -> bool:
+        self._set_task_queue_status(request.task_id, QueueStatus.RUNNING)
+        try:
+            self._dispatch_task(config=config, request=request)
+        except Exception as exc:
+            self._rollback_failed_dispatch(request=request, error=exc)
+            if propagate_error:
+                raise
+            return False
+        return True
+
+    def _rollback_failed_dispatch(self, *, request: DispatchRequest, error: Exception) -> None:
+        now = datetime.now(timezone.utc)
+
+        def mutate(state: SessionsState) -> None:
+            state.global_queue = [task_id for task_id in state.global_queue if task_id != request.task_id]
+            state.global_queue.insert(0, request.task_id)
+
+            session = next((item for item in state.sessions if item.session_id == request.session_id), None)
+            if session is None:
+                return
+
+            session.queue = [task_id for task_id in session.queue if task_id != request.task_id]
+            if session.current_task_id == request.task_id:
+                session.current_task_id = None
+            _drop_task_history_entry(session, request.task_id)
+            _clear_active_run(session)
+            session.last_heartbeat = now
+
+            if request.created_session and _session_has_no_work(session):
+                state.sessions = [item for item in state.sessions if item.session_id != session.session_id]
+                return
+
+            session.status = SessionStatus.IDLE
+
+        self.sessions_repo.update(mutate)
+        self._set_task_queue_status(request.task_id, QueueStatus.QUEUED_GLOBALLY)
+        self.tasks_log.append(
+            TaskEvent(
+                event_type="task_dispatch_failed",
+                task_id=request.task_id,
+                payload={
+                    "session_id": request.session_id,
+                    "source": request.original_queue_source,
+                    "created_session": request.created_session,
+                    "error": str(error),
+                },
+            )
+        )
+
+    def _restore_reserved_dispatch_requests(
+        self,
+        *,
+        failed_request: DispatchRequest,
+        requests: list[DispatchRequest],
+    ) -> None:
+        if not requests:
+            return
+
+        task_ids = [request.task_id for request in requests]
+        now = datetime.now(timezone.utc)
+
+        def mutate(state: SessionsState) -> None:
+            insert_at = 0
+            if state.global_queue and state.global_queue[0] == failed_request.task_id:
+                insert_at = 1
+            state.global_queue[insert_at:insert_at] = task_ids
+
+            for request in requests:
+                session = next((item for item in state.sessions if item.session_id == request.session_id), None)
+                if session is None:
+                    continue
+
+                session.queue = [task_id for task_id in session.queue if task_id != request.task_id]
+                if session.current_task_id == request.task_id:
+                    session.current_task_id = None
+                _drop_task_history_entry(session, request.task_id)
+                _clear_active_run(session)
+                session.last_heartbeat = now
+
+                if request.created_session and _session_has_no_work(session):
+                    state.sessions = [item for item in state.sessions if item.session_id != session.session_id]
+                    continue
+
+                session.status = SessionStatus.IDLE
+
+        self.sessions_repo.update(mutate)
+
+    def _update_task_snapshot(
+        self,
+        task_id: str,
+        *,
+        queue_status: QueueStatus | None = None,
+        routing: TaskRouting | None = None,
+    ) -> Task:
+        task = self._load_task(task_id)
+        if queue_status is not None:
+            task.queue_status = queue_status
+        if routing is not None:
+            task.routing = routing
+        self.task_repo.save(task)
+        return task
+
+    def _set_task_queue_status(self, task_id: str, queue_status: QueueStatus) -> None:
+        self._update_task_snapshot(task_id, queue_status=queue_status)
+
     def _selected_backend(self, config: AppConfig) -> WorkerBackend:
         return self.worker_backend or config.worker.backend
 
@@ -714,11 +1107,31 @@ def _session_matches_run(session: Session, active_run: ActiveRun) -> bool:
     return True
 
 
+def _session_has_active_run(session: Session) -> bool:
+    return any(
+        value is not None
+        for value in (
+            session.active_run_id,
+            session.active_pid,
+            session.active_run_started_at,
+            session.last_run_output_path,
+        )
+    )
+
+
 def _clear_active_run(session: Session) -> None:
     session.active_run_id = None
     session.active_pid = None
     session.active_run_started_at = None
     session.last_run_output_path = None
+
+
+def _drop_task_history_entry(session: Session, task_id: str) -> None:
+    session.task_history = [entry for entry in session.task_history if entry.task_id != task_id]
+
+
+def _session_has_no_work(session: Session) -> bool:
+    return session.current_task_id is None and not session.queue and not session.task_history
 
 
 def _validate_route_decision(

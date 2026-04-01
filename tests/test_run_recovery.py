@@ -4,6 +4,7 @@ from pathlib import Path
 from leopard_gecko.adapters.base import WorkerPort, WorkerRunState, WorkerSubmission
 from leopard_gecko.adapters.codex import CodexAdapter
 from leopard_gecko.models.session import SessionStatus, TaskHistoryStatus
+from leopard_gecko.models.task import QueueStatus
 from leopard_gecko.orchestrator.pipeline import Orchestrator
 from leopard_gecko.router.policy import RouteAction, RouteDecision
 
@@ -162,6 +163,7 @@ def test_poll_runs_blocks_session_when_run_exit_cannot_be_recovered(tmp_path) ->
     assert session.active_pid is None
     assert session.worker_context_id == "ctx_recovered"
     assert _history_status(session, submission.task_id) is TaskHistoryStatus.INTERRUPTED
+    assert orchestrator.task_repo.load(submission.task_id).queue_status is QueueStatus.FAILED
 
 
 def _prepare_run_files(
