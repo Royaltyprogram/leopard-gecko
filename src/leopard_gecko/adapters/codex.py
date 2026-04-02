@@ -306,7 +306,8 @@ class CodexAdapter(WorkerPort):
         if output_path is None or not output_path.exists():
             return None
 
-        worker_context_id: str | None = None
+        thread_id: str | None = None
+        session_id: str | None = None
         for line in output_path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped:
@@ -315,8 +316,10 @@ class CodexAdapter(WorkerPort):
                 event = json.loads(stripped)
             except json.JSONDecodeError:
                 continue
-            worker_context_id = self._extract_context_id(event) or worker_context_id
-        return worker_context_id
+            candidate_thread_id, candidate_session_id = self._extract_context_ids(event)
+            thread_id = candidate_thread_id or thread_id
+            session_id = candidate_session_id or session_id
+        return thread_id or session_id
 
     def parse_output_for_last_message(self, output_path: Path | None) -> str | None:
         if output_path is None or not output_path.exists():
@@ -335,18 +338,20 @@ class CodexAdapter(WorkerPort):
         return last_message
 
     @staticmethod
-    def _extract_context_id(event: object) -> str | None:
+    def _extract_context_ids(event: object) -> tuple[str | None, str | None]:
         if not isinstance(event, dict):
-            return None
+            return None, None
 
+        thread_id: str | None = None
+        session_id: str | None = None
         for candidate in (event, event.get("data"), event.get("payload")):
             if not isinstance(candidate, dict):
                 continue
-            for key in ("thread_id", "session_id"):
-                value = candidate.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-        return None
+            if thread_id is None:
+                thread_id = _read_non_empty_str(candidate.get("thread_id"))
+            if session_id is None:
+                session_id = _read_non_empty_str(candidate.get("session_id"))
+        return thread_id, session_id
 
     @staticmethod
     def _extract_last_message(event: object) -> str | None:
@@ -416,9 +421,20 @@ class CodexAdapter(WorkerPort):
             return
 
         current = self._read_json(state_path)
+        current_worker_context_id = _read_str(current, "worker_context_id")
+        current_last_message = _read_str(current, "last_message")
+        payload_worker_context_id = worker_context_id or current_worker_context_id
+        payload_last_message = last_message or current_last_message
+
+        if (
+            current_worker_context_id == payload_worker_context_id
+            and current_last_message == payload_last_message
+        ):
+            return
+
         payload = {
-            "worker_context_id": worker_context_id or _read_str(current, "worker_context_id"),
-            "last_message": last_message or _read_str(current, "last_message"),
+            "worker_context_id": payload_worker_context_id,
+            "last_message": payload_last_message,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         self._write_json(state_path, payload)
@@ -434,7 +450,10 @@ def _read_int(payload: dict[str, Any] | None, key: str) -> int | None:
 def _read_str(payload: dict[str, Any] | None, key: str) -> str | None:
     if payload is None:
         return None
-    value = payload.get(key)
+    return _read_non_empty_str(payload.get(key))
+
+
+def _read_non_empty_str(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 

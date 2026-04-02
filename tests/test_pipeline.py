@@ -2,13 +2,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import subprocess
+import threading
+import time
 
 import pytest
 
 from leopard_gecko.adapters.base import WorkerPort, WorkerRunState, WorkerSubmission
 from leopard_gecko.models.config import AppConfig, WorkerBackend
-from leopard_gecko.models.session import Session, SessionStatus, TaskHistoryStatus
-from leopard_gecko.models.task import QueueStatus, RoutingDecision, Task
+from leopard_gecko.models.session import (
+    Session,
+    SessionsState,
+    SessionStatus,
+    TaskHistoryStatus,
+)
+from leopard_gecko.models.task import QueueStatus, RoutingDecision, Task, TaskRouting
 from leopard_gecko.orchestrator.pipeline import Orchestrator
 from leopard_gecko.router.policy import RouteAction, RouteDecision, RoutingError, SessionSnapshot
 
@@ -119,6 +126,20 @@ class FakeTaskNotePort:
         return f"n::{user_prompt}"
 
 
+class BlockingTaskNotePort:
+    kind = "blocking-note"
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def make_note(self, user_prompt: str) -> str:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise AssertionError("blocking note port was not released")
+        return f"n::{user_prompt}"
+
+
 class FakeRouter:
     kind = "fake-router"
     history_limit = 2
@@ -203,6 +224,37 @@ class ScenarioRouter:
         )
 
 
+class BlockingSecondDecisionRouter:
+    kind = "blocking-second-decision-router"
+    history_limit = 5
+
+    def __init__(self) -> None:
+        self._delegate = ScenarioRouter()
+        self._call_count = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def decide(
+        self,
+        *,
+        task,
+        config,
+        sessions: list[SessionSnapshot],
+        global_queue_size: int,
+    ) -> RouteDecision:
+        self._call_count += 1
+        if self._call_count == 2:
+            self.entered.set()
+            if not self.release.wait(timeout=5):
+                raise AssertionError("blocking router was not released")
+        return self._delegate.decide(
+            task=task,
+            config=config,
+            sessions=sessions,
+            global_queue_size=global_queue_size,
+        )
+
+
 def test_submit_creates_then_reuses_related_session(tmp_path) -> None:
     worker = FakeWorkerAdapter()
     task_note_port = FakeTaskNotePort()
@@ -237,6 +289,68 @@ def test_submit_creates_then_reuses_related_session(tmp_path) -> None:
     assert worker.received_cwds == [orchestrator.cwd]
     assert _snapshot_status(orchestrator, first.task_id) is QueueStatus.RUNNING
     assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.QUEUED_IN_SESSION
+
+
+def test_submit_tracks_turn_count_for_session_assignments(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    task_note_port = FakeTaskNotePort()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=task_note_port,
+        router=ScenarioRouter(),
+    )
+
+    first = orchestrator.submit("add admin users pagination")
+    second = orchestrator.submit("also fix admin users pagination button style")
+    session = orchestrator.load_sessions().sessions[0]
+
+    assert session.session_id == first.assigned_session_id
+    assert session.turn_count == 2
+    assert session.queue == [second.task_id]
+
+
+def test_submit_rejects_existing_session_at_turn_limit(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+
+    class ExistingSessionRouter:
+        kind = "existing-session-router"
+        history_limit = 1
+
+        def decide(
+            self,
+            *,
+            task,
+            config,
+            sessions: list[SessionSnapshot],
+            global_queue_size: int,
+        ) -> RouteDecision:
+            del task, config, global_queue_size
+            return RouteDecision(
+                action=RouteAction.ASSIGN_EXISTING,
+                session_id=sessions[0].session_id,
+                reason="force existing session for test",
+            )
+
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ExistingSessionRouter(),
+    )
+    orchestrator.init_storage()
+    orchestrator.sessions_repo.update(
+        lambda state: state.sessions.append(
+            Session(
+                session_id="sess_full",
+                status=SessionStatus.IDLE,
+                turn_count=5,
+            )
+        )
+    )
+
+    with pytest.raises(RoutingError, match="turn limit"):
+        orchestrator.submit("continue in the same session")
 
 
 def test_submit_uses_session_worktree_when_enabled(tmp_path) -> None:
@@ -537,7 +651,7 @@ def test_poll_completion_dispatches_next_queued_task(tmp_path) -> None:
     assert orchestrator.task_repo.load(second.task_id).queue_status is QueueStatus.RUNNING
 
 
-def test_codex_completion_enters_cooldown_before_becoming_idle(tmp_path) -> None:
+def test_codex_completion_becomes_idle_immediately(tmp_path) -> None:
     worker = FakeWorkerAdapter()
     orchestrator = Orchestrator(
         data_dir=str(tmp_path / ".leopard-gecko"),
@@ -547,14 +661,7 @@ def test_codex_completion_enters_cooldown_before_becoming_idle(tmp_path) -> None
     )
     config = orchestrator.init_storage().model_copy(
         update={
-            "worker": AppConfig.default().worker.model_copy(
-                update={
-                    "backend": WorkerBackend.CODEX,
-                    "codex": AppConfig.default().worker.codex.model_copy(
-                        update={"completed_session_cooldown_sec": 15}
-                    ),
-                }
-            )
+            "worker": AppConfig.default().worker.model_copy(update={"backend": WorkerBackend.CODEX})
         }
     )
     orchestrator.config_repo.save(config)
@@ -573,29 +680,12 @@ def test_codex_completion_enters_cooldown_before_becoming_idle(tmp_path) -> None
 
     assert poll_result.completed == 1
     assert poll_result.dispatched == 0
-    assert session.status is SessionStatus.COOLDOWN
-    assert session.current_task_id is None
-    assert session.cooldown_until is not None
-
-    orchestrator.sessions_repo.update(
-        lambda state: setattr(
-            state.sessions[0],
-            "cooldown_until",
-            datetime.now(timezone.utc) - timedelta(seconds=1),
-        )
-    )
-
-    poll_result = orchestrator.poll_runs()
-    session = orchestrator.load_sessions().sessions[0]
-
-    assert poll_result.completed == 0
-    assert poll_result.dispatched == 0
     assert session.status is SessionStatus.IDLE
-    assert session.cooldown_until is None
+    assert session.current_task_id is None
     assert orchestrator.task_repo.load(first.task_id).queue_status is QueueStatus.COMPLETED
 
 
-def test_submit_during_codex_cooldown_queues_follow_up_until_cooldown_expires(tmp_path) -> None:
+def test_submit_after_codex_completion_reuses_idle_session_immediately(tmp_path) -> None:
     worker = FakeWorkerAdapter()
     orchestrator = Orchestrator(
         data_dir=str(tmp_path / ".leopard-gecko"),
@@ -605,14 +695,7 @@ def test_submit_during_codex_cooldown_queues_follow_up_until_cooldown_expires(tm
     )
     config = orchestrator.init_storage().model_copy(
         update={
-            "worker": AppConfig.default().worker.model_copy(
-                update={
-                    "backend": WorkerBackend.CODEX,
-                    "codex": AppConfig.default().worker.codex.model_copy(
-                        update={"completed_session_cooldown_sec": 15}
-                    ),
-                }
-            )
+            "worker": AppConfig.default().worker.model_copy(update={"backend": WorkerBackend.CODEX})
         }
     )
     orchestrator.config_repo.save(config)
@@ -630,25 +713,8 @@ def test_submit_during_codex_cooldown_queues_follow_up_until_cooldown_expires(tm
     second = orchestrator.submit("also fix admin users pagination button style")
     session = orchestrator.load_sessions().sessions[0]
 
-    assert second.queue_status is QueueStatus.QUEUED_IN_SESSION
+    assert second.queue_status is QueueStatus.RUNNING
     assert second.assigned_session_id == first.assigned_session_id
-    assert session.status is SessionStatus.COOLDOWN
-    assert session.current_task_id is None
-    assert session.queue == [second.task_id]
-
-    orchestrator.sessions_repo.update(
-        lambda state: setattr(
-            state.sessions[0],
-            "cooldown_until",
-            datetime.now(timezone.utc) - timedelta(seconds=1),
-        )
-    )
-
-    poll_result = orchestrator.poll_runs()
-    session = orchestrator.load_sessions().sessions[0]
-
-    assert poll_result.completed == 0
-    assert poll_result.dispatched == 1
     assert session.status is SessionStatus.BUSY
     assert session.current_task_id == second.task_id
     assert session.queue == []
@@ -728,18 +794,112 @@ def test_poll_failure_still_dispatches_next_queued_task(tmp_path) -> None:
     )
 
     poll_result = orchestrator.poll_runs()
+    sessions = orchestrator.load_sessions().sessions
+    retried_task = orchestrator.task_repo.load(first.task_id)
+
+    assert poll_result.failed == 1
+    assert poll_result.dispatched == 2
+    assert len(sessions) == 2
+    assert sessions[0].current_task_id == second.task_id
+    assert sessions[0].worker_context_id == "ctx_failed"
+    assert sessions[1].current_task_id == first.task_id
+    assert worker.received_context_ids == [None, "ctx_failed", None]
+    assert _history_status(sessions[0], first.task_id) is TaskHistoryStatus.FAILED
+    assert _history_status(sessions[0], second.task_id) is TaskHistoryStatus.RUNNING
+    assert _history_status(sessions[1], first.task_id) is TaskHistoryStatus.RUNNING
+    assert _snapshot_status(orchestrator, first.task_id) is QueueStatus.RUNNING
+    assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.RUNNING
+    assert retried_task.queue_status is QueueStatus.RUNNING
+    assert retried_task.retry_count == 1
+
+
+def test_poll_unknown_session_failure_clears_stale_worker_context(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    config = orchestrator.init_storage().model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    first = orchestrator.submit("add admin users pagination")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_done",
+        last_message="done",
+    )
+    orchestrator.poll_runs()
+
+    second = orchestrator.submit("also fix admin users pagination button style")
+    worker.set_poll_state(
+        worker.submissions[1].run_id,
+        is_running=False,
+        exit_code=1,
+        last_message="Unknown session_id: ctx_done",
+    )
+
+    poll_result = orchestrator.poll_runs()
     session = orchestrator.load_sessions().sessions[0]
+    retried_task = orchestrator.task_repo.load(second.task_id)
 
     assert poll_result.failed == 1
     assert poll_result.dispatched == 1
+    assert session.session_id == first.assigned_session_id
+    assert session.status is SessionStatus.BUSY
     assert session.current_task_id == second.task_id
-    assert session.worker_context_id == "ctx_failed"
-    assert worker.received_context_ids == [None, "ctx_failed"]
-    assert _history_status(session, first.task_id) is TaskHistoryStatus.FAILED
-    assert _history_status(session, second.task_id) is TaskHistoryStatus.RUNNING
-    assert _snapshot_status(orchestrator, first.task_id) is QueueStatus.FAILED
-    assert _snapshot_status(orchestrator, second.task_id) is QueueStatus.RUNNING
-    assert orchestrator.task_repo.load(first.task_id).queue_status is QueueStatus.FAILED
+    assert retried_task.queue_status is QueueStatus.RUNNING
+    assert retried_task.retry_count == 1
+    assert worker.received_context_ids == [None, "ctx_done", None]
+
+
+def test_poll_failure_stops_retrying_after_max_retries(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=FakeRouter(),
+    )
+    config = orchestrator.init_storage().model_copy(update={"max_terminal_num": 1})
+    orchestrator.config_repo.save(config)
+
+    submission = orchestrator.submit("keep retrying until the limit")
+
+    for expected_retry in (1, 2, 3):
+        worker.set_poll_state(
+            worker.submissions[-1].run_id,
+            is_running=False,
+            exit_code=1,
+            last_message=f"boom-{expected_retry}",
+        )
+        poll_result = orchestrator.poll_runs()
+        task = orchestrator.task_repo.load(submission.task_id)
+
+        assert poll_result.failed == 1
+        assert poll_result.dispatched == 1
+        assert task.queue_status is QueueStatus.RUNNING
+        assert task.retry_count == expected_retry
+
+    worker.set_poll_state(
+        worker.submissions[-1].run_id,
+        is_running=False,
+        exit_code=1,
+        last_message="boom-final",
+    )
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+    task = orchestrator.task_repo.load(submission.task_id)
+
+    assert poll_result.failed == 1
+    assert poll_result.dispatched == 0
+    assert task.queue_status is QueueStatus.FAILED
+    assert task.retry_count == 3
+    assert session.status is SessionStatus.IDLE
+    assert session.current_task_id is None
 
 
 def test_poll_completion_rolls_back_failed_session_queue_dispatch(tmp_path) -> None:
@@ -1488,6 +1648,117 @@ def test_submit_uses_injected_note_port_and_router(tmp_path) -> None:
     assert router.calls[0]["sessions"] == []
 
 
+def test_submit_and_poll_runs_are_serialized_per_orchestrator(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    task_note_port = BlockingTaskNotePort()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=task_note_port,
+        router=FakeRouter(),
+    )
+
+    submit_result: dict[str, object] = {}
+    poll_result: dict[str, object] = {}
+
+    submit_thread = threading.Thread(
+        target=lambda: submit_result.setdefault(
+            "result",
+            orchestrator.submit("add admin users pagination"),
+        )
+    )
+    submit_thread.start()
+    assert task_note_port.entered.wait(timeout=5)
+
+    poll_thread = threading.Thread(
+        target=lambda: poll_result.setdefault("result", orchestrator.poll_runs())
+    )
+    poll_thread.start()
+
+    time.sleep(0.1)
+    assert "result" not in poll_result
+
+    task_note_port.release.set()
+    submit_thread.join(timeout=5)
+    poll_thread.join(timeout=5)
+
+    assert not submit_thread.is_alive()
+    assert not poll_thread.is_alive()
+    assert submit_result["result"].queue_status is QueueStatus.RUNNING
+    assert poll_result["result"].running == 1
+    assert len(worker.submissions) == 1
+
+
+def test_concurrent_follow_up_submit_and_poll_do_not_drop_session_queue_task(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    router = BlockingSecondDecisionRouter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=router,
+    )
+
+    first = orchestrator.submit("add admin users pagination")
+    worker.set_poll_state(
+        worker.submissions[0].run_id,
+        is_running=False,
+        exit_code=0,
+        worker_context_id="ctx_done",
+        last_message="done",
+    )
+
+    submit_result: dict[str, object] = {}
+    poll_result: dict[str, object] = {}
+
+    submit_thread = threading.Thread(
+        target=lambda: submit_result.setdefault(
+            "result",
+            orchestrator.submit("also fix admin users pagination button style"),
+        )
+    )
+    submit_thread.start()
+    assert router.entered.wait(timeout=5)
+
+    poll_thread = threading.Thread(
+        target=lambda: poll_result.setdefault("result", orchestrator.poll_runs())
+    )
+    poll_thread.start()
+
+    time.sleep(0.1)
+    assert "result" not in poll_result
+
+    router.release.set()
+    submit_thread.join(timeout=5)
+    poll_thread.join(timeout=5)
+
+    assert not submit_thread.is_alive()
+    assert not poll_thread.is_alive()
+
+    second = submit_result["result"]
+    final_state = orchestrator.load_sessions()
+    session = final_state.sessions[0]
+    second_task = orchestrator.task_repo.load(second.task_id)
+
+    assert second.queue_status is QueueStatus.QUEUED_IN_SESSION
+    assert second.assigned_session_id == first.assigned_session_id
+    assert poll_result["result"].completed == 1
+    assert poll_result["result"].dispatched == 1
+    assert session.current_task_id == second.task_id
+    assert session.queue == []
+    assert _history_status(session, first.task_id) is TaskHistoryStatus.COMPLETED
+    assert _history_status(session, second.task_id) is TaskHistoryStatus.RUNNING
+    assert second_task.queue_status is QueueStatus.RUNNING
+    assert len(worker.submissions) == 2
+    assert worker.submissions[1].task_id == second.task_id
+    assert worker.received_context_ids == [None, "ctx_done"]
+    assert not any(
+        event.event_type == "task_requeued_from_orphaned_session_queue"
+        and event.task_id == second.task_id
+        for event in orchestrator.tasks_log.read_all()
+    )
+
+
 def test_submit_raises_when_router_returns_invalid_existing_session(tmp_path) -> None:
     worker = FakeWorkerAdapter()
 
@@ -1524,6 +1795,67 @@ def test_submit_raises_when_default_task_note_generator_cannot_run(tmp_path, mon
 
     with pytest.raises(RoutingError, match="Missing OpenAI API key"):
         orchestrator.submit("add admin users pagination")
+
+
+def test_poll_requeues_orphaned_session_queue_task_and_dispatches_it(tmp_path) -> None:
+    worker = FakeWorkerAdapter()
+    orchestrator = Orchestrator(
+        data_dir=str(tmp_path / ".leopard-gecko"),
+        worker=worker,
+        task_note_port=FakeTaskNotePort(),
+        router=ScenarioRouter(),
+    )
+    orchestrator.init_storage()
+    now = datetime.now(timezone.utc)
+
+    orchestrator.sessions_repo.save(
+        SessionsState(
+            sessions=[
+                Session(
+                    session_id="sess_reuse",
+                    status=SessionStatus.IDLE,
+                    turn_count=1,
+                    created_at=now,
+                    last_heartbeat=now,
+                )
+            ],
+            global_queue=[],
+        )
+    )
+    orchestrator.task_repo.save(
+        Task(
+            task_id="task_orphaned",
+            user_prompt="also fix admin users pagination button style",
+            task_note="n::also fix admin users pagination button style",
+            routing=TaskRouting(
+                assigned_session_id="sess_reuse",
+                decision=RoutingDecision.ASSIGNED_EXISTING,
+                reason="matched_for_test score=3",
+            ),
+            queue_status=QueueStatus.QUEUED_IN_SESSION,
+            created_at=now,
+        )
+    )
+
+    poll_result = orchestrator.poll_runs()
+    session = orchestrator.load_sessions().sessions[0]
+    task = orchestrator.task_repo.load("task_orphaned")
+    recovery_event = _latest_event(
+        orchestrator,
+        "task_requeued_from_orphaned_session_queue",
+        task_id="task_orphaned",
+    )
+
+    assert poll_result.dispatched == 1
+    assert session.session_id == "sess_reuse"
+    assert session.current_task_id == "task_orphaned"
+    assert session.queue == []
+    assert session.turn_count == 1
+    assert _history_status(session, "task_orphaned") is TaskHistoryStatus.RUNNING
+    assert task.queue_status is QueueStatus.RUNNING
+    assert recovery_event.payload["session_id"] == "sess_reuse"
+    assert recovery_event.payload["reason"] == "missing_session_queue"
+    assert worker.submissions[0].task_id == "task_orphaned"
 
 
 def _history_status(session, task_id: str) -> TaskHistoryStatus:

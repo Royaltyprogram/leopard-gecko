@@ -22,6 +22,7 @@ class RouteAction(StrEnum):
 class SessionSnapshot(BaseModel):
     session_id: str
     status: SessionStatus
+    turn_count: int = 0
     current_task_id: str | None = None
     queue_size: int = 0
     recent_history: list[TaskHistoryEntry] = Field(default_factory=list)
@@ -66,6 +67,7 @@ def build_session_snapshots(
             SessionSnapshot(
                 session_id=session.session_id,
                 status=session.status,
+                turn_count=session.turn_count,
                 current_task_id=session.current_task_id,
                 queue_size=len(session.queue),
                 recent_history=recent_history,

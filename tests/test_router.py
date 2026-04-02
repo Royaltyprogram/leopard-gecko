@@ -62,6 +62,7 @@ def test_build_session_snapshots_limits_recent_history() -> None:
 
     assert len(snapshots) == 1
     assert snapshots[0].queue_size == 1
+    assert snapshots[0].turn_count == 0
     assert [entry.task_id for entry in snapshots[0].recent_history] == ["task_2"]
     assert snapshots[0].recent_summary == "latest summary"
 
@@ -89,7 +90,7 @@ def test_agent_task_note_generator_calls_openai_responses(monkeypatch) -> None:
         }
     )
     generator = AgentTaskNoteGenerator(
-        AgentRouterConfig(model="gpt-5-mini"),
+        AgentRouterConfig(model="gpt-5.4-mini"),
         transport=transport,
     )
 
@@ -135,7 +136,7 @@ def test_agent_router_calls_openai_responses_with_structured_output(monkeypatch)
             ]
         }
     )
-    router = AgentRouter(AgentRouterConfig(model="gpt-5-mini", history_limit=3), transport=transport)
+    router = AgentRouter(AgentRouterConfig(model="gpt-5.4-mini", history_limit=3), transport=transport)
     config = AppConfig.default()
     task = Task(
         task_id="task_new",
@@ -170,6 +171,9 @@ def test_agent_router_calls_openai_responses_with_structured_output(monkeypatch)
     assert payload["model"] == "gpt-5"
     assert payload["text"]["format"]["name"] == "route_decision"
     assert payload["reasoning"] == {"effort": "low"}
+    router_input = json.loads(payload["input"][1]["content"])
+    assert router_input["constraints"]["max_turns_per_session"] == 5
+    assert router_input["sessions"][0]["turn_count"] == 0
 
 
 def test_agent_router_raises_when_api_key_is_missing(monkeypatch) -> None:

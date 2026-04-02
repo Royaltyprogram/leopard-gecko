@@ -8,9 +8,7 @@ from leopard_gecko.models.session import SessionsState, SessionStatus
 class StatusBar(Static):
     def update_from_state(self, state: SessionsState, *, poll_info: str = "") -> None:
         sessions = state.sessions
-        busy = sum(
-            1 for s in sessions if s.status in {SessionStatus.BUSY, SessionStatus.COOLDOWN}
-        )
+        busy = sum(1 for s in sessions if s.status is SessionStatus.BUSY)
         idle = sum(1 for s in sessions if s.status == SessionStatus.IDLE)
         blocked = sum(1 for s in sessions if s.status == SessionStatus.BLOCKED)
         dead = sum(1 for s in sessions if s.status == SessionStatus.DEAD)

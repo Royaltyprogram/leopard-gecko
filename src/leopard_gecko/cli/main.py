@@ -76,9 +76,7 @@ def status(data_dir: str | None = typer.Option(None, help="Override data directo
     state = orchestrator.load_sessions()
     sessions = state.sessions
 
-    busy_count = sum(
-        1 for session in sessions if session.status in {SessionStatus.BUSY, SessionStatus.COOLDOWN}
-    )
+    busy_count = sum(1 for session in sessions if session.status is SessionStatus.BUSY)
     idle_count = sum(1 for session in sessions if session.status is SessionStatus.IDLE)
     blocked_count = sum(1 for session in sessions if session.status is SessionStatus.BLOCKED)
     dead_count = sum(1 for session in sessions if session.status is SessionStatus.DEAD)

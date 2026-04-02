@@ -185,6 +185,55 @@ def test_codex_adapter_poll_backfills_state_from_small_files_and_output(tmp_path
     assert payload["last_message"] == "done from file"
 
 
+def test_codex_adapter_skips_unchanged_state_write(tmp_path, monkeypatch) -> None:
+    output_path = tmp_path / "worker_runs" / "sess_1" / "task_1.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path = output_path.with_name("task_1.state.json")
+    state_path.write_text(
+        json.dumps(
+            {
+                "worker_context_id": "ctx_from_state",
+                "last_message": "done from state",
+                "updated_at": "2026-04-01T00:00:00+00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    adapter = CodexAdapter()
+    monkeypatch.setattr(
+        adapter,
+        "_write_json",
+        lambda path, payload: (_ for _ in ()).throw(
+            AssertionError(f"state file should not be rewritten: {path} {payload}")
+        ),
+    )
+
+    adapter._write_state_file(
+        output_path=output_path,
+        worker_context_id="ctx_from_state",
+        last_message="done from state",
+    )
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["updated_at"] == "2026-04-01T00:00:00+00:00"
+
+
+def test_codex_adapter_prefers_thread_id_over_later_session_id(tmp_path) -> None:
+    output_path = tmp_path / "worker_runs" / "sess_1" / "task_1.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        '{"type":"thread","data":{"thread_id":"thread_123"}}\n'
+        '{"type":"turn","data":{"session_id":"session_456"}}\n',
+        encoding="utf-8",
+    )
+
+    adapter = CodexAdapter()
+
+    assert adapter.parse_output_for_context_id(output_path) == "thread_123"
+
+
 def test_build_worker_override_prefers_explicit_backend() -> None:
     config = AppConfig.default()
 

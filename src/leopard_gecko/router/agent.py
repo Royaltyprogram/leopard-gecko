@@ -62,6 +62,7 @@ def _system_prompt() -> str:
     return (
         "You are a context router for a coding-agent orchestrator. "
         "Choose exactly one routing action for the incoming task. "
+        "Keep sessions short and avoid letting a single session grow past its turn budget. "
         "Respect the provided capacity and queue constraints. "
         "Return only the requested structured output."
     )
@@ -84,6 +85,7 @@ def _router_input(
         "constraints": {
             "max_terminal_num": config.max_terminal_num,
             "max_queue_per_session": config.queue_policy.max_queue_per_session,
+            "max_turns_per_session": config.router.agent.max_turns_per_session,
             "live_session_count": live_sessions,
             "global_queue_size": global_queue_size,
         },
@@ -93,6 +95,15 @@ def _router_input(
             "create_new_session is allowed only when live_session_count is less than max_terminal_num",
             "enqueue_global is for waiting globally when no suitable session should be reused and a new session cannot be started now",
             "prefer keeping related work in the same session, but avoid mixing unrelated work",
+            (
+                "generally do not let a single session exceed "
+                f"{config.router.agent.max_turns_per_session} turns"
+            ),
+            (
+                "if a session already has "
+                f"{config.router.agent.max_turns_per_session} turns, do not assign_existing to it; "
+                "create_new_session instead when capacity allows, otherwise enqueue_global"
+            ),
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)

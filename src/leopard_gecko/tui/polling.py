@@ -52,7 +52,6 @@ class TUIPollManager:
 
     async def force_refresh(self) -> None:
         loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self._orchestrator.poll_runs)
         state = await loop.run_in_executor(None, self._orchestrator.load_sessions)
-        from leopard_gecko.orchestrator.pipeline import PollRunsResult
-
-        self._app.post_message(PollCompleted(result=PollRunsResult(), state=state))
+        self._app.post_message(PollCompleted(result=result, state=state))

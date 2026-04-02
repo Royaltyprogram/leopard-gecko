@@ -13,6 +13,8 @@ def test_task_defaults_and_trimming() -> None:
     assert task.user_prompt == "add pagination to admin users"
     assert task.task_note == "admin/users domain"
     assert task.queue_status is QueueStatus.PENDING
+    assert task.retry_count == 0
+    assert task.max_retries == 3
     assert task.routing.decision is RoutingDecision.PENDING
     assert task.created_at.tzinfo is not None
 
@@ -23,10 +25,10 @@ def test_config_defaults() -> None:
     assert config.max_terminal_num == 4
     assert config.queue_policy.max_queue_per_session == 5
     assert config.router.backend is RouterBackend.AGENT
-    assert config.router.agent.model == "gpt-5-mini"
+    assert config.router.agent.model == "gpt-5.4-mini"
     assert config.router.agent.api_key_env_var == "OPENAI_API_KEY"
+    assert config.router.agent.max_turns_per_session == 5
     assert config.worker.backend is WorkerBackend.NOOP
-    assert config.worker.codex.completed_session_cooldown_sec == 15
     assert config.worktree.enabled is False
     assert config.worktree.branch_prefix == "lg"
     assert config.data_dir == ".leopard-gecko"
@@ -37,7 +39,7 @@ def test_agent_router_runtime_model_uses_openai_model_env(monkeypatch) -> None:
 
     config = AppConfig.default(data_dir=".leopard-gecko")
 
-    assert config.router.agent.model == "gpt-5-mini"
+    assert config.router.agent.model == "gpt-5.4-mini"
     assert config.router.agent.runtime_model == "gpt-5"
 
 
@@ -47,8 +49,8 @@ def test_session_state_defaults() -> None:
 
     assert state.global_queue == []
     assert session.queue == []
+    assert session.turn_count == 0
     assert session.current_task_id is None
-    assert session.cooldown_until is None
     assert session.worker_backend is None
     assert session.worker_context_id is None
     assert session.worktree_path is None
@@ -63,6 +65,7 @@ def test_session_state_defaults() -> None:
 def test_session_runtime_fields_round_trip() -> None:
     session = Session(
         session_id="sess_1",
+        turn_count=3,
         worker_backend="codex",
         worker_context_id="thread_123",
         worktree_path="/tmp/worktrees/sess_1",
@@ -76,6 +79,7 @@ def test_session_runtime_fields_round_trip() -> None:
     restored = Session.model_validate(session.model_dump(mode="json"))
 
     assert restored.worker_backend == "codex"
+    assert restored.turn_count == 3
     assert restored.worker_context_id == "thread_123"
     assert restored.worktree_path == "/tmp/worktrees/sess_1"
     assert restored.worktree_branch == "lg/sess_1"

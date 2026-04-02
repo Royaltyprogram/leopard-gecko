@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from secrets import token_hex
+from threading import RLock
 
 from pydantic import BaseModel, Field
 
@@ -95,6 +96,7 @@ class PolledRun(BaseModel):
 class TaskQueueStatusUpdate(BaseModel):
     task_id: str
     queue_status: QueueStatus
+    retry_count: int | None = None
 
 
 class DispatchContext(BaseModel):
@@ -102,6 +104,12 @@ class DispatchContext(BaseModel):
     worker_context_id: str | None = None
     backend: str
     worktree: SessionWorktree | None = None
+
+
+class QueuedTaskRecovery(BaseModel):
+    task_id: str
+    session_id: str | None = None
+    reason: str
 
 
 class PollMutation(BaseModel):
@@ -134,6 +142,7 @@ class Orchestrator:
         self.worker_backend = WorkerBackend(worker_backend) if worker_backend else None
         self.task_note_port = task_note_port
         self.router = router
+        self._operation_lock = RLock()
 
     def init_storage(self) -> AppConfig:
         config = self.config_repo.initialize()
@@ -149,105 +158,113 @@ class Orchestrator:
         return self.sessions_repo.load()
 
     def submit(self, user_prompt: str) -> SubmissionResult:
-        normalized_prompt = user_prompt.strip()
-        if not normalized_prompt:
-            raise ValueError("user_prompt must not be blank")
+        with self._operation_lock:
+            normalized_prompt = user_prompt.strip()
+            if not normalized_prompt:
+                raise ValueError("user_prompt must not be blank")
 
-        config = self.init_storage()
-        task_note_port = self._resolve_task_note_port(config)
-        task = Task(
-            task_id=_generate_prefixed_id("task"),
-            user_prompt=normalized_prompt,
-            task_note=task_note_port.make_note(normalized_prompt),
-        )
-        self.task_repo.save(task)
-
-        self.tasks_log.append(
-            TaskEvent(
-                event_type="task_created",
-                task_id=task.task_id,
-                payload=task.model_dump(mode="json"),
+            config = self.init_storage()
+            task_note_port = self._resolve_task_note_port(config)
+            task = Task(
+                task_id=_generate_prefixed_id("task"),
+                user_prompt=normalized_prompt,
+                task_note=task_note_port.make_note(normalized_prompt),
             )
-        )
+            self.task_repo.save(task)
 
-        mutation = self.sessions_repo.update(
-            lambda state: self._apply_submission(state=state, task=task, config=config)
-        )
-        self._persist_expire_result(mutation.expire_result)
-        self._update_task_snapshot(
-            task.task_id,
-            queue_status=task.queue_status,
-            routing=task.routing,
-        )
-        self.tasks_log.append(
-            TaskEvent(
-                event_type="task_routed",
-                task_id=task.task_id,
-                payload={
-                    "decision": task.routing.decision,
-                    "assigned_session_id": mutation.result.assigned_session_id,
-                    "queue_status": task.queue_status,
-                    "reason": task.routing.reason,
-                },
-            )
-        )
-
-        if mutation.dispatch_request is not None:
-            self._dispatch_with_rollback(
-                config=config,
-                request=mutation.dispatch_request,
-                propagate_error=True,
-            )
-
-        return mutation.result
-
-    def poll_runs(self) -> PollRunsResult:
-        config = self.init_storage()
-        worker = self._resolve_worker(config)
-        now = datetime.now(timezone.utc)
-        expire_result = self._expire_stale_sessions_in_repo(config=config, now=now)
-        self._persist_expire_result(expire_result)
-        snapshot = self.sessions_repo.load_snapshot()
-        polled_runs: list[PolledRun] = []
-
-        for active_run in self._collect_active_runs(snapshot.state):
-            polled_runs.append(
-                PolledRun(
-                    active_run=active_run,
-                    run_state=worker.poll(
-                        run_id=active_run.run_id,
-                        process_id=active_run.process_id,
-                        output_path=active_run.output_path,
-                    ),
+            self.tasks_log.append(
+                TaskEvent(
+                    event_type="task_created",
+                    task_id=task.task_id,
+                    payload=task.model_dump(mode="json"),
                 )
             )
 
-        mutation = self.sessions_repo.update_from_snapshot(
-            snapshot,
-            lambda state: self._apply_polled_runs(
-                state=state,
-                config=config,
-                polled_runs=polled_runs,
-            ),
-        )
-
-        for status_update in mutation.task_status_updates:
-            self._set_task_queue_status(status_update.task_id, status_update.queue_status)
-
-        for event in mutation.task_events:
-            self.tasks_log.append(event)
-
-        for index, request in enumerate(mutation.dispatch_requests):
-            if self._dispatch_with_rollback(config=config, request=request):
-                mutation.poll_result.dispatched += 1
-                continue
-            self._restore_reserved_dispatch_requests(
-                failed_request=request,
-                requests=mutation.dispatch_requests[index + 1 :],
+            mutation = self.sessions_repo.update(
+                lambda state: self._apply_submission(state=state, task=task, config=config)
             )
-            break
+            self._persist_expire_result(mutation.expire_result)
+            self._update_task_snapshot(
+                task.task_id,
+                queue_status=task.queue_status,
+                routing=task.routing,
+            )
+            self.tasks_log.append(
+                TaskEvent(
+                    event_type="task_routed",
+                    task_id=task.task_id,
+                    payload={
+                        "decision": task.routing.decision,
+                        "assigned_session_id": mutation.result.assigned_session_id,
+                        "queue_status": task.queue_status,
+                        "reason": task.routing.reason,
+                    },
+                )
+            )
 
-        return mutation.poll_result
+            if mutation.dispatch_request is not None:
+                self._dispatch_with_rollback(
+                    config=config,
+                    request=mutation.dispatch_request,
+                    propagate_error=True,
+                )
+
+            return mutation.result
+
+    def poll_runs(self) -> PollRunsResult:
+        with self._operation_lock:
+            config = self.init_storage()
+            self._reconcile_orphaned_running_tasks(config=config)
+            worker = self._resolve_worker(config)
+            now = datetime.now(timezone.utc)
+            expire_result = self._expire_stale_sessions_in_repo(config=config, now=now)
+            self._persist_expire_result(expire_result)
+            self._reconcile_orphaned_queued_session_tasks()
+            snapshot = self.sessions_repo.load_snapshot()
+            polled_runs: list[PolledRun] = []
+
+            for active_run in self._collect_active_runs(snapshot.state):
+                polled_runs.append(
+                    PolledRun(
+                        active_run=active_run,
+                        run_state=worker.poll(
+                            run_id=active_run.run_id,
+                            process_id=active_run.process_id,
+                            output_path=active_run.output_path,
+                        ),
+                    )
+                )
+
+            mutation = self.sessions_repo.update_from_snapshot(
+                snapshot,
+                lambda state: self._apply_polled_runs(
+                    state=state,
+                    config=config,
+                    polled_runs=polled_runs,
+                ),
+            )
+
+            for status_update in mutation.task_status_updates:
+                self._update_task_snapshot(
+                    status_update.task_id,
+                    queue_status=status_update.queue_status,
+                    retry_count=status_update.retry_count,
+                )
+
+            for event in mutation.task_events:
+                self.tasks_log.append(event)
+
+            for index, request in enumerate(mutation.dispatch_requests):
+                if self._dispatch_with_rollback(config=config, request=request):
+                    mutation.poll_result.dispatched += 1
+                    continue
+                self._restore_reserved_dispatch_requests(
+                    failed_request=request,
+                    requests=mutation.dispatch_requests[index + 1 :],
+                )
+                break
+
+            return mutation.poll_result
 
     def _apply_submission(
         self,
@@ -308,6 +325,7 @@ class Orchestrator:
                 task.queue_status = QueueStatus.RUNNING
             else:
                 session.queue.append(task.task_id)
+                session.turn_count += 1
                 session.task_history.append(
                     TaskHistoryEntry(
                         task_id=task.task_id,
@@ -438,6 +456,145 @@ class Orchestrator:
                     )
                 )
 
+    def _reconcile_orphaned_running_tasks(self, *, config: AppConfig) -> None:
+        state = self.sessions_repo.load()
+        known_session_ids = {session.session_id for session in state.sessions}
+        orphaned_tasks = [
+            task
+            for task in self.task_repo.list_by_status(QueueStatus.RUNNING)
+            if task.queue_status is QueueStatus.RUNNING
+            and task.routing.assigned_session_id is not None
+            and task.routing.assigned_session_id not in known_session_ids
+        ]
+        if not orphaned_tasks:
+            return
+
+        worker = self._resolve_worker(config)
+        for task in orphaned_tasks:
+            session_id = task.routing.assigned_session_id
+            if session_id is None:
+                continue
+
+            run_state = worker.poll(
+                run_id=None,
+                process_id=None,
+                output_path=self.paths.worker_runs_dir / session_id / f"{task.task_id}.jsonl",
+            )
+            if run_state.is_running:
+                continue
+
+            queue_status = QueueStatus.COMPLETED if run_state.exit_code == 0 else QueueStatus.FAILED
+            self._set_task_queue_status(task.task_id, queue_status)
+            self.tasks_log.append(
+                TaskEvent(
+                    event_type="task_reconciled_from_orphaned_run",
+                    task_id=task.task_id,
+                    payload={
+                        "session_id": session_id,
+                        "queue_status": queue_status,
+                        "exit_code": run_state.exit_code,
+                        "summary": run_state.last_message,
+                        "recovery_reason": run_state.recovery_reason,
+                    },
+                )
+            )
+
+    def _reconcile_orphaned_queued_session_tasks(self) -> list[QueuedTaskRecovery]:
+        state = self.sessions_repo.load()
+        sessions_by_id = {session.session_id: session for session in state.sessions}
+        recoveries: list[QueuedTaskRecovery] = []
+
+        for task in self.task_repo.list_by_status(QueueStatus.QUEUED_IN_SESSION):
+            session_id = task.routing.assigned_session_id
+            if session_id is None:
+                recoveries.append(
+                    QueuedTaskRecovery(
+                        task_id=task.task_id,
+                        session_id=None,
+                        reason="missing_assigned_session",
+                    )
+                )
+                continue
+
+            session = sessions_by_id.get(session_id)
+            if session is None:
+                recoveries.append(
+                    QueuedTaskRecovery(
+                        task_id=task.task_id,
+                        session_id=session_id,
+                        reason="missing_session",
+                    )
+                )
+                continue
+            if session.status is SessionStatus.DEAD:
+                recoveries.append(
+                    QueuedTaskRecovery(
+                        task_id=task.task_id,
+                        session_id=session_id,
+                        reason="dead_session",
+                    )
+                )
+                continue
+            if session.current_task_id == task.task_id:
+                continue
+
+            in_queue = task.task_id in session.queue
+            has_history = any(entry.task_id == task.task_id for entry in session.task_history)
+            if in_queue and has_history:
+                continue
+
+            recoveries.append(
+                QueuedTaskRecovery(
+                    task_id=task.task_id,
+                    session_id=session_id,
+                    reason="missing_session_queue" if not in_queue else "missing_session_history",
+                )
+            )
+
+        if not recoveries:
+            return []
+
+        recovery_ids = {recovery.task_id for recovery in recoveries}
+
+        def mutate(state: SessionsState) -> None:
+            state.global_queue = [recovery.task_id for recovery in recoveries] + [
+                task_id for task_id in state.global_queue if task_id not in recovery_ids
+            ]
+
+            for recovery in recoveries:
+                session = next(
+                    (item for item in state.sessions if item.session_id == recovery.session_id),
+                    None,
+                )
+                if session is None:
+                    continue
+
+                session.queue = [task_id for task_id in session.queue if task_id != recovery.task_id]
+                removed_history = _drop_task_history_entry(
+                    session,
+                    recovery.task_id,
+                    revert_started_turn=True,
+                )
+                if not removed_history and session.turn_count > 0:
+                    session.turn_count -= 1
+
+        self.sessions_repo.update(mutate)
+
+        for recovery in recoveries:
+            self._set_task_queue_status(recovery.task_id, QueueStatus.QUEUED_GLOBALLY)
+            self.tasks_log.append(
+                TaskEvent(
+                    event_type="task_requeued_from_orphaned_session_queue",
+                    task_id=recovery.task_id,
+                    payload={
+                        "session_id": recovery.session_id,
+                        "reason": recovery.reason,
+                    },
+                )
+            )
+
+        return recoveries
+
     def _requeue_dead_session_tasks(
         self,
         *,
@@ -498,6 +655,7 @@ class Orchestrator:
         for polled_run in polled_runs:
             active_run = polled_run.active_run
             run_state = polled_run.run_state
+            task = self._load_task(active_run.task_id)
 
             if run_state.is_running:
                 updated = self._refresh_running_session(
@@ -510,6 +668,41 @@ class Orchestrator:
                 continue
 
             if run_state.requires_manual_recovery:
+                retry_transition = self._retry_failed_task(
+                    state=state,
+                    config=config,
+                    active_run=active_run,
+                    run_state=run_state,
+                    task=task,
+                    history_status=TaskHistoryStatus.INTERRUPTED,
+                )
+                if retry_transition is not None:
+                    mutation.poll_result.failed += 1
+                    mutation.task_status_updates.append(
+                        TaskQueueStatusUpdate(
+                            task_id=active_run.task_id,
+                            queue_status=QueueStatus.QUEUED_GLOBALLY,
+                            retry_count=task.retry_count,
+                        )
+                    )
+                    mutation.task_events.append(
+                        TaskEvent(
+                            event_type="task_retry_scheduled",
+                            task_id=active_run.task_id,
+                            payload={
+                                "session_id": active_run.session_id,
+                                "run_id": active_run.run_id,
+                                "summary": run_state.last_message,
+                                "reason": run_state.recovery_reason,
+                                "retry_count": task.retry_count,
+                                "max_retries": task.max_retries,
+                            },
+                        )
+                    )
+                    if retry_transition.next_dispatch is not None:
+                        mutation.dispatch_requests.append(retry_transition.next_dispatch)
+                    continue
+
                 blocked = self._block_run(
                     state=state,
                     active_run=active_run,
@@ -536,13 +729,13 @@ class Orchestrator:
                     )
                 continue
 
-            transition = self._finalize_run(
-                state=state,
-                config=config,
-                active_run=active_run,
-                run_state=run_state,
-            )
             if run_state.exit_code == 0:
+                transition = self._finalize_run(
+                    state=state,
+                    config=config,
+                    active_run=active_run,
+                    run_state=run_state,
+                )
                 mutation.poll_result.completed += 1
                 mutation.task_status_updates.append(
                     TaskQueueStatusUpdate(
@@ -552,6 +745,47 @@ class Orchestrator:
                 )
                 event_type = "task_completed"
             else:
+                retry_transition = self._retry_failed_task(
+                    state=state,
+                    config=config,
+                    active_run=active_run,
+                    run_state=run_state,
+                    task=task,
+                    history_status=TaskHistoryStatus.FAILED,
+                )
+                if retry_transition is not None:
+                    mutation.poll_result.failed += 1
+                    mutation.task_status_updates.append(
+                        TaskQueueStatusUpdate(
+                            task_id=active_run.task_id,
+                            queue_status=QueueStatus.QUEUED_GLOBALLY,
+                            retry_count=task.retry_count,
+                        )
+                    )
+                    mutation.task_events.append(
+                        TaskEvent(
+                            event_type="task_retry_scheduled",
+                            task_id=active_run.task_id,
+                            payload={
+                                "session_id": active_run.session_id,
+                                "run_id": active_run.run_id,
+                                "exit_code": run_state.exit_code,
+                                "summary": run_state.last_message,
+                                "retry_count": task.retry_count,
+                                "max_retries": task.max_retries,
+                            },
+                        )
+                    )
+                    if retry_transition.next_dispatch is not None:
+                        mutation.dispatch_requests.append(retry_transition.next_dispatch)
+                    continue
+
+                transition = self._finalize_run(
+                    state=state,
+                    config=config,
+                    active_run=active_run,
+                    run_state=run_state,
+                )
                 mutation.poll_result.failed += 1
                 mutation.task_status_updates.append(
                     TaskQueueStatusUpdate(
@@ -577,15 +811,36 @@ class Orchestrator:
             if transition.next_dispatch is not None:
                 mutation.dispatch_requests.append(transition.next_dispatch)
 
-        mutation.dispatch_requests.extend(
-            self._release_completed_session_cooldowns(
-                state=state,
-                config=config,
-                now=datetime.now(timezone.utc),
-            )
-        )
         mutation.dispatch_requests.extend(self._reserve_dispatchable_global_tasks(state=state, config=config))
         return mutation
+
+    def _retry_failed_task(
+        self,
+        *,
+        state: SessionsState,
+        config: AppConfig,
+        active_run: ActiveRun,
+        run_state: WorkerRunState,
+        task: Task,
+        history_status: TaskHistoryStatus,
+    ) -> TransitionResult | None:
+        if task.retry_count >= task.max_retries:
+            return None
+
+        session = _find_session(state, active_run.session_id)
+        if not _session_matches_run(session, active_run):
+            return None
+
+        transition = self._close_running_task(
+            config=config,
+            session=session,
+            task_id=active_run.task_id,
+            next_status=history_status,
+            run_state=run_state,
+        )
+        state.global_queue.insert(0, active_run.task_id)
+        task.retry_count += 1
+        return transition
 
     def _reserve_dispatchable_global_tasks(
         self,
@@ -669,10 +924,11 @@ class Orchestrator:
         history_entry.summary = run_state.last_message
         history_entry.updated_at = now
 
-        if run_state.worker_context_id:
+        if _should_reset_worker_context(run_state):
+            session.worker_context_id = None
+        elif run_state.worker_context_id:
             session.worker_context_id = run_state.worker_context_id
         session.status = SessionStatus.BLOCKED
-        session.cooldown_until = None
         session.last_heartbeat = now
         _clear_active_run(session)
         return True
@@ -724,7 +980,9 @@ class Orchestrator:
         history_entry.summary = run_state.last_message
         history_entry.updated_at = now
 
-        if run_state.worker_context_id:
+        if _should_reset_worker_context(run_state):
+            session.worker_context_id = None
+        elif run_state.worker_context_id:
             session.worker_context_id = run_state.worker_context_id
         session.last_heartbeat = now
         _clear_active_run(session)
@@ -737,7 +995,6 @@ class Orchestrator:
                 next_task = self._load_task(next_task_id)
                 session.current_task_id = next_task.task_id
                 session.status = SessionStatus.BUSY
-                session.cooldown_until = None
                 next_history_entry = _find_history_entry(session, next_task.task_id)
                 next_history_entry.status = TaskHistoryStatus.RUNNING
                 next_history_entry.updated_at = now
@@ -749,71 +1006,9 @@ class Orchestrator:
                     promoted_from_queue="session",
                 )
             else:
-                session.cooldown_until = self._session_completion_cooldown_until(
-                    config=config,
-                    now=now,
-                )
-                session.status = (
-                    SessionStatus.COOLDOWN
-                    if session.cooldown_until is not None
-                    else SessionStatus.IDLE
-                )
+                session.status = SessionStatus.IDLE
 
         return TransitionResult(next_dispatch=next_dispatch)
-
-    def _session_completion_cooldown_until(
-        self,
-        *,
-        config: AppConfig,
-        now: datetime,
-    ) -> datetime | None:
-        if self._selected_backend(config) is not WorkerBackend.CODEX:
-            return None
-
-        seconds = config.worker.codex.completed_session_cooldown_sec
-        if seconds <= 0:
-            return None
-        return now + timedelta(seconds=seconds)
-
-    def _release_completed_session_cooldowns(
-        self,
-        *,
-        state: SessionsState,
-        config: AppConfig,
-        now: datetime,
-    ) -> list[DispatchRequest]:
-        requests: list[DispatchRequest] = []
-
-        for session in state.sessions:
-            if session.status is not SessionStatus.COOLDOWN:
-                continue
-            if session.cooldown_until is None or now < session.cooldown_until:
-                continue
-
-            session.cooldown_until = None
-            if session.queue:
-                next_task_id = session.queue.pop(0)
-                next_task = self._load_task(next_task_id)
-                session.status = SessionStatus.BUSY
-                session.current_task_id = next_task.task_id
-                session.last_heartbeat = now
-                next_history_entry = _find_history_entry(session, next_task.task_id)
-                next_history_entry.status = TaskHistoryStatus.RUNNING
-                next_history_entry.updated_at = now
-                requests.append(
-                    DispatchRequest(
-                        session_id=session.session_id,
-                        task_id=next_task.task_id,
-                        user_prompt=next_task.user_prompt,
-                        original_queue_source="session",
-                        promoted_from_queue="session",
-                    )
-                )
-                continue
-
-            session.status = SessionStatus.IDLE
-
-        return requests
 
     def _promote_next_global_task(
         self,
@@ -863,7 +1058,7 @@ class Orchestrator:
         idle_sessions = sum(
             1
             for session in state.sessions
-            if session.status is SessionStatus.IDLE and session.current_task_id is None
+            if _session_can_accept_new_turn(session, config)
         )
         remaining_capacity = max(config.max_terminal_num - live_session_count(state.sessions), 0)
         return idle_sessions + remaining_capacity
@@ -886,7 +1081,7 @@ class Orchestrator:
             (
                 session
                 for session in state.sessions
-                if session.status is SessionStatus.IDLE and session.current_task_id is None
+                if _session_can_accept_new_turn(session, config)
             ),
             None,
         )
@@ -918,8 +1113,8 @@ class Orchestrator:
     ) -> DispatchRequest:
         now = datetime.now(timezone.utc)
         session.status = SessionStatus.BUSY
+        session.turn_count += 1
         session.current_task_id = task.task_id
-        session.cooldown_until = None
         session.last_heartbeat = now
         session.task_history.append(
             TaskHistoryEntry(
@@ -949,8 +1144,8 @@ class Orchestrator:
         session = Session(
             session_id=_generate_prefixed_id("sess"),
             status=SessionStatus.BUSY,
+            turn_count=1,
             current_task_id=task.task_id,
-            cooldown_until=None,
             last_heartbeat=now,
         )
         session.task_history.append(
@@ -1156,9 +1351,8 @@ class Orchestrator:
             session.queue = [task_id for task_id in session.queue if task_id != request.task_id]
             if session.current_task_id == request.task_id:
                 session.current_task_id = None
-            _drop_task_history_entry(session, request.task_id)
+            _drop_task_history_entry(session, request.task_id, revert_started_turn=True)
             _clear_active_run(session)
-            session.cooldown_until = None
             session.last_heartbeat = now
             if dispatch_context and dispatch_context.worktree and dispatch_context.worktree.created and cleanup_error is None:
                 session.worktree_path = None
@@ -1170,7 +1364,6 @@ class Orchestrator:
                 return
 
             session.status = SessionStatus.IDLE
-            session.cooldown_until = None
 
         self.sessions_repo.update(mutate)
         self._set_task_queue_status(request.task_id, QueueStatus.QUEUED_GLOBALLY)
@@ -1214,7 +1407,7 @@ class Orchestrator:
                 session.queue = [task_id for task_id in session.queue if task_id != request.task_id]
                 if session.current_task_id == request.task_id:
                     session.current_task_id = None
-                _drop_task_history_entry(session, request.task_id)
+                _drop_task_history_entry(session, request.task_id, revert_started_turn=True)
                 _clear_active_run(session)
                 session.last_heartbeat = now
 
@@ -1223,7 +1416,6 @@ class Orchestrator:
                     continue
 
                 session.status = SessionStatus.IDLE
-                session.cooldown_until = None
 
         self.sessions_repo.update(mutate)
 
@@ -1233,12 +1425,15 @@ class Orchestrator:
         *,
         queue_status: QueueStatus | None = None,
         routing: TaskRouting | None = None,
+        retry_count: int | None = None,
     ) -> Task:
         task = self._load_task(task_id)
         if queue_status is not None:
             task.queue_status = queue_status
         if routing is not None:
             task.routing = routing
+        if retry_count is not None:
+            task.retry_count = retry_count
         self.task_repo.save(task)
         return task
 
@@ -1309,12 +1504,34 @@ def _clear_active_run(session: Session) -> None:
     session.last_run_output_path = None
 
 
-def _drop_task_history_entry(session: Session, task_id: str) -> None:
+def _drop_task_history_entry(
+    session: Session,
+    task_id: str,
+    *,
+    revert_started_turn: bool = False,
+) -> bool:
+    removed = any(entry.task_id == task_id for entry in session.task_history)
     session.task_history = [entry for entry in session.task_history if entry.task_id != task_id]
+    if removed and revert_started_turn and session.turn_count > 0:
+        session.turn_count -= 1
+    return removed
 
 
 def _session_has_no_work(session: Session) -> bool:
     return session.current_task_id is None and not session.queue and not session.task_history
+
+
+def _session_can_accept_new_turn(session: Session, config: AppConfig) -> bool:
+    return (
+        session.status is SessionStatus.IDLE
+        and session.current_task_id is None
+        and session.turn_count < config.router.agent.max_turns_per_session
+    )
+
+
+def _should_reset_worker_context(run_state: WorkerRunState) -> bool:
+    message = (run_state.last_message or "").lower()
+    return "unknown session_id" in message or "unknown session id" in message
 
 
 def _validate_route_decision(
@@ -1333,6 +1550,8 @@ def _validate_route_decision(
             raise RoutingError(f"Router returned unknown session_id: {route.session_id}")
         if session.status is SessionStatus.DEAD:
             raise RoutingError(f"Router returned dead session_id: {route.session_id}")
+        if session.turn_count >= config.router.agent.max_turns_per_session:
+            raise RoutingError(f"Router returned session_id at turn limit: {route.session_id}")
         if session.queue_size >= config.queue_policy.max_queue_per_session:
             raise RoutingError(f"Router returned full session_id: {route.session_id}")
         return

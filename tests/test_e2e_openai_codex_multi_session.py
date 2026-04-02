@@ -115,7 +115,7 @@ def test_real_openai_router_and_multiple_codex_sessions(tmp_path, monkeypatch) -
         (first_session, first.task_id, "FIRST"),
         (second_session, second.task_id, "SECOND"),
     ):
-        assert session.status in {SessionStatus.COOLDOWN, SessionStatus.IDLE}
+        assert session.status is SessionStatus.IDLE
         assert session.current_task_id is None
         assert session.active_run_id is None
         assert session.active_pid is None

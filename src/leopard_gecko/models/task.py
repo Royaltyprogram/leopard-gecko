@@ -33,6 +33,8 @@ class Task(BaseModel):
     task_note: str
     routing: TaskRouting = Field(default_factory=TaskRouting)
     queue_status: QueueStatus = QueueStatus.PENDING
+    retry_count: int = Field(default=0, ge=0)
+    max_retries: int = Field(default=3, ge=0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @field_validator("user_prompt", "task_note")
@@ -49,4 +51,3 @@ class TaskEvent(BaseModel):
     task_id: str
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     payload: dict[str, Any] = Field(default_factory=dict)
-

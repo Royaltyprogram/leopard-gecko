@@ -2,34 +2,17 @@ Screen {
     layout: vertical;
 }
 
-/* ── Dashboard ── */
-
-#dashboard-sessions {
-    height: 1fr;
-    margin: 1 2;
-}
-
-#dashboard-gq {
-    height: auto;
-    max-height: 12;
-    margin: 0 2 1 2;
-}
-
-#gq-title {
-    text-style: bold;
-    margin-bottom: 1;
-}
-
-#gq-content {
-    color: $text-muted;
-}
-
 /* ── Submit ── */
 
-#submit-log {
+#routing-viz {
     height: 1fr;
-    margin: 1 2;
-    border: solid $primary-lighten-3;
+    margin: 0 1;
+}
+
+#submit-hint {
+    height: auto;
+    margin: 0 2;
+    color: $text-muted;
 }
 
 #submit-input-area {
@@ -47,30 +30,92 @@ Screen {
     margin-left: 1;
 }
 
-/* ── Detail ── */
+/* ── Config ── */
 
-#detail-header {
+#config-header {
     height: auto;
-    margin: 1 2;
+    margin: 1 2 0 2;
     padding: 1;
     border: solid $primary-lighten-3;
 }
 
-#detail-output {
-    height: 1fr;
-    margin: 0 2;
+#config-form {
+    margin: 1 2;
+    padding: 0 1 1 1;
     border: solid $surface-lighten-1;
 }
 
-#detail-history {
+.config-section-title {
+    margin-top: 1;
+    text-style: bold;
+    color: $accent;
+}
+
+.config-label {
+    margin-top: 1;
+}
+
+.config-note {
+    color: $text-muted;
+}
+
+.config-input, .config-select {
+    width: 1fr;
+}
+
+.config-toggle-row {
     height: auto;
-    max-height: 10;
+    margin-top: 1;
+    align: left middle;
+}
+
+.config-toggle-label {
+    width: 1fr;
+}
+
+#config-actions {
+    height: auto;
+    margin-top: 2;
+    margin-bottom: 1;
+}
+
+#config-actions Button {
+    width: 16;
+    margin-right: 1;
+}
+
+/* ── Detail ── */
+
+#detail-header {
+    height: auto;
+    margin: 1 2 0 2;
+    padding: 1;
+    border: solid $primary-lighten-3;
+}
+
+#detail-body {
+    height: 1fr;
     margin: 1 2;
 }
 
-#detail-history-title {
-    text-style: bold;
-    margin-bottom: 1;
+#task-list {
+    width: 28;
+    min-width: 24;
+    border: solid $surface-lighten-1;
+}
+
+#task-detail-panel {
+    width: 1fr;
+    border: solid $surface-lighten-1;
+    margin-left: 1;
+}
+
+#detail-output {
+    height: auto;
+    max-height: 12;
+    margin: 0 2;
+    border: solid $surface-lighten-1;
+    display: none;
 }
 
 /* ── Status Bar ── */

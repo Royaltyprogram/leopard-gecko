@@ -4,7 +4,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field
 
 
-DEFAULT_OPENAI_MODEL = "gpt-5-mini"
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 
 
 def _read_env_override(name: str) -> str | None:
@@ -35,6 +35,7 @@ class AgentRouterConfig(BaseModel):
     base_url: str = "https://api.openai.com/v1/responses"
     timeout_sec: float = Field(default=30.0, gt=0)
     history_limit: int = Field(default=5, ge=1)
+    max_turns_per_session: int = Field(default=5, ge=1)
     reasoning_effort: str | None = "low"
 
     @property
@@ -53,7 +54,6 @@ class CodexWorkerConfig(BaseModel):
     approval_policy: str = "never"
     model: str | None = None
     profile: str | None = None
-    completed_session_cooldown_sec: int = Field(default=15, ge=0)
 
 
 class WorkerConfig(BaseModel):

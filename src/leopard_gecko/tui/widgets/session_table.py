@@ -7,7 +7,6 @@ from leopard_gecko.models.session import SessionsState, SessionStatus
 STATUS_STYLE = {
     SessionStatus.IDLE: "green",
     SessionStatus.BUSY: "yellow",
-    SessionStatus.COOLDOWN: "cyan",
     SessionStatus.BLOCKED: "red",
     SessionStatus.DEAD: "dim",
 }

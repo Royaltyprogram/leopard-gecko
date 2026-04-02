@@ -4,7 +4,7 @@ from pathlib import Path
 from leopard_gecko.adapters.base import WorkerPort, WorkerRunState, WorkerSubmission
 from leopard_gecko.adapters.codex import CodexAdapter
 from leopard_gecko.models.session import SessionStatus, TaskHistoryStatus
-from leopard_gecko.models.task import QueueStatus
+from leopard_gecko.models.task import QueueStatus, Task, TaskRouting
 from leopard_gecko.orchestrator.pipeline import Orchestrator
 from leopard_gecko.router.policy import RouteAction, RouteDecision
 
@@ -152,18 +152,124 @@ def test_poll_runs_blocks_session_when_run_exit_cannot_be_recovered(tmp_path) ->
     submission = orchestrator.submit("finish this carefully")
     poll_result = orchestrator.poll_runs()
     session = orchestrator.load_sessions().sessions[0]
+    task = orchestrator.task_repo.load(submission.task_id)
+
+    assert poll_result.running == 0
+    assert poll_result.completed == 0
+    assert poll_result.failed == 1
+    assert poll_result.dispatched == 1
+    assert session.status is SessionStatus.BUSY
+    assert session.current_task_id == submission.task_id
+    assert session.active_run_id is not None
+    assert session.active_pid is not None
+    assert session.worker_context_id == "ctx_recovered"
+    assert session.task_history[0].status is TaskHistoryStatus.INTERRUPTED
+    assert session.task_history[-1].status is TaskHistoryStatus.RUNNING
+    assert task.queue_status is QueueStatus.RUNNING
+    assert task.retry_count == 1
+
+
+def test_poll_runs_reconciles_orphaned_running_task_from_exit_file(tmp_path, monkeypatch) -> None:
+    data_dir = tmp_path / ".leopard-gecko"
+    orchestrator = Orchestrator(data_dir=str(data_dir))
+    orchestrator.init_storage()
+
+    task_id = "task_orphaned"
+    session_id = "sess_missing"
+    orchestrator.task_repo.save(
+        Task(
+            task_id=task_id,
+            user_prompt="wrap up the orphaned task",
+            task_note="note::wrap up the orphaned task",
+            queue_status=QueueStatus.RUNNING,
+            routing=TaskRouting(assigned_session_id=session_id),
+        )
+    )
+    _prepare_run_files(
+        root=data_dir,
+        session_id=session_id,
+        task_id=task_id,
+        meta_payload={
+            "run_id": f"codex:{session_id}:{task_id}",
+            "task_id": task_id,
+            "session_id": session_id,
+            "pid": 999999,
+            "started_at": "2026-04-01T00:00:00+00:00",
+            "worker_context_id": "ctx_meta",
+            "output_path": str(data_dir / "worker_runs" / session_id / f"{task_id}.jsonl"),
+            "status": "running",
+        },
+        exit_payload={
+            "exit_code": 0,
+            "finished_at": "2026-04-01T00:10:00+00:00",
+        },
+        output_lines=[],
+        last_message="done",
+    )
+    monkeypatch.setattr(CodexAdapter, "_is_process_running", staticmethod(lambda pid: False))
+
+    poll_result = orchestrator.poll_runs()
+    task = orchestrator.task_repo.load(task_id)
 
     assert poll_result.running == 0
     assert poll_result.completed == 0
     assert poll_result.failed == 0
     assert poll_result.dispatched == 0
-    assert session.status is SessionStatus.BLOCKED
-    assert session.current_task_id == submission.task_id
-    assert session.active_run_id is None
-    assert session.active_pid is None
-    assert session.worker_context_id == "ctx_recovered"
-    assert _history_status(session, submission.task_id) is TaskHistoryStatus.INTERRUPTED
-    assert orchestrator.task_repo.load(submission.task_id).queue_status is QueueStatus.FAILED
+    assert task.queue_status is QueueStatus.COMPLETED
+
+
+def test_poll_runs_reconciles_orphaned_running_task_without_list_all(tmp_path, monkeypatch) -> None:
+    data_dir = tmp_path / ".leopard-gecko"
+    orchestrator = Orchestrator(data_dir=str(data_dir))
+    orchestrator.init_storage()
+
+    task_id = "task_orphaned"
+    session_id = "sess_missing"
+    orchestrator.task_repo.save(
+        Task(
+            task_id=task_id,
+            user_prompt="wrap up the orphaned task",
+            task_note="note::wrap up the orphaned task",
+            queue_status=QueueStatus.RUNNING,
+            routing=TaskRouting(assigned_session_id=session_id),
+        )
+    )
+    _prepare_run_files(
+        root=data_dir,
+        session_id=session_id,
+        task_id=task_id,
+        meta_payload={
+            "run_id": f"codex:{session_id}:{task_id}",
+            "task_id": task_id,
+            "session_id": session_id,
+            "pid": 999999,
+            "started_at": "2026-04-01T00:00:00+00:00",
+            "worker_context_id": "ctx_meta",
+            "output_path": str(data_dir / "worker_runs" / session_id / f"{task_id}.jsonl"),
+            "status": "running",
+        },
+        exit_payload={
+            "exit_code": 0,
+            "finished_at": "2026-04-01T00:10:00+00:00",
+        },
+        output_lines=[],
+        last_message="done",
+    )
+    monkeypatch.setattr(CodexAdapter, "_is_process_running", staticmethod(lambda pid: False))
+    monkeypatch.setattr(
+        orchestrator.task_repo,
+        "list_all",
+        lambda: (_ for _ in ()).throw(AssertionError("list_all should not be called during poll")),
+    )
+
+    poll_result = orchestrator.poll_runs()
+    task = orchestrator.task_repo.load(task_id)
+
+    assert poll_result.running == 0
+    assert poll_result.completed == 0
+    assert poll_result.failed == 0
+    assert poll_result.dispatched == 0
+    assert task.queue_status is QueueStatus.COMPLETED
 
 
 def _prepare_run_files(
