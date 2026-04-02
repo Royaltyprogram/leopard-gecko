@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/leopard-demo.gif" alt="Leopard Gecko Routing Demo" width="800" />
+  <img src="assets/demo.png" alt="Leopard Gecko Routing Demo" width="800" />
 </p>
 
 ---
