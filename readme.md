@@ -10,6 +10,10 @@
 </p>
 
 <p align="center">
+  <a href="https://discord.gg/8B2WBcAvM"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
+</p>
+
+<p align="center">
   <img src="assets/leopard-demo.gif" alt="Leopard Gecko Routing Demo" width="800" />
 </p>
 
