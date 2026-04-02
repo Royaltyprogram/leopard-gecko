@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <video src="assets/laopard-demo.mp4" autoplay loop muted playsinline width="800"></video>
+  <img src="assets/leopard-demo.gif" alt="Leopard Gecko Routing Demo" width="800" />
 </p>
 
 ---
