@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1200">
+<title>Leopard Gecko - Routing Animation</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@700;800;900&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #08080e; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, dpr;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resize();
+window.addEventListener('resize', () => { resize(); layoutTerminals(); });
+
+// ── Theme ──
+const C = {
+  bg: '#08080e',
+  termBg: '#0c0c14',
+  termBar: '#161622',
+  accent: '#f0c040',
+  green: '#34d399',
+  blue: '#60a5fa',
+  purple: '#a78bfa',
+  cyan: '#22d3ee',
+  red: '#f87171',
+  pink: '#f472b6',
+  orange: '#fb923c',
+  text: '#c8c8dd',
+  dim: '#444460',
+  prompt: '#888899',
+};
+const TERM_COLORS = [C.green, C.blue, C.purple, C.cyan, C.pink, C.orange];
+
+// ── Prompts (English, realistic coding tasks) ──
+const PROMPTS = [
+  "Add pagination to users API",
+  "Refactor auth middleware",
+  "Fix checkout race condition",
+  "Build search autocomplete",
+  "Add WebSocket notifications",
+  "Write unit tests for cart",
+  "Set up Redis caching layer",
+  "Create image upload endpoint",
+  "Implement OAuth2 flow",
+  "Add dark mode to dashboard",
+  "Migrate DB to PostgreSQL",
+  "Build CSV export feature",
+  "Fix memory leak in worker",
+  "Add rate limiting middleware",
+  "Create email template system",
+  "Implement SSR for landing",
+  "Add Stripe payment webhook",
+  "Build analytics dashboard",
+  "Create CI/CD pipeline",
+  "Add i18n support",
+  "Optimize SQL query perf",
+  "Build real-time chat",
+  "Add file preview component",
+  "Create admin role system",
+  "Set up error monitoring",
+  "Build batch job scheduler",
+  "Add GraphQL subscriptions",
+  "Create A/B test framework",
+  "Implement 2FA with TOTP",
+  "Add drag-and-drop kanban",
+];
+
+// ── Terminal Session Objects ──
+const NUM_TERMINALS = 36;
+const terminals = [];
+let routerCY;
+
+// Terminal output lines to simulate real work
+const TERM_OUTPUTS = [
+  ['$ codex "Add pagination"', '> Reading src/api/users.ts...', '> Adding offset/limit params...', '> Writing tests...', '> Done. 3 files changed.'],
+  ['$ codex "Fix race condition"', '> Analyzing checkout flow...', '> Found mutex issue in L47...', '> Applying fix...', '> All tests passing.'],
+  ['$ codex "Build search"', '> Indexing documents...', '> Creating trie structure...', '> Adding debounce handler...', '> Search component ready.'],
+  ['$ codex "Auth middleware"', '> Reading middleware chain...', '> Extracting JWT validator...', '> Adding refresh logic...', '> Auth refactored.'],
+  ['$ codex "WebSocket notifs"', '> Setting up WS server...', '> Creating event handlers...', '> Adding reconnect logic...', '> Notifications live.'],
+  ['$ codex "Redis caching"', '> Connecting to Redis...', '> Adding cache decorators...', '> Setting TTL policies...', '> Cache layer active.'],
+  ['$ codex "Unit tests"', '> Scanning cart module...', '> Generating test cases...', '> Running 24 tests...', '> All 24 tests passed.'],
+  ['$ codex "Image upload"', '> Creating multer config...', '> Adding S3 integration...', '> Writing resize logic...', '> Upload endpoint ready.'],
+];
+
+function layoutTerminals() {
+  terminals.length = 0;
+  routerCY = H * 0.30;
+
+  const cols = Math.min(Math.ceil(Math.sqrt(NUM_TERMINALS * (W / H) * 1.2)), 9);
+  const rows = Math.ceil(NUM_TERMINALS / cols);
+  const startY = H * 0.48;
+  const endY = H - 16;
+  const marginX = 32;
+  const availW = W - marginX * 2;
+  const availH = endY - startY;
+  const cellW = availW / cols;
+  const cellH = availH / rows;
+  const termW = Math.min(cellW - 8, 160);
+  const termH = Math.min(cellH - 6, 90);
+
+  for (let i = 0; i < NUM_TERMINALS; i++) {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const cx = marginX + col * cellW + cellW / 2;
+    const cy = startY + row * cellH + cellH / 2;
+    const color = TERM_COLORS[i % TERM_COLORS.length];
+    const outputSet = TERM_OUTPUTS[i % TERM_OUTPUTS.length];
+
+    terminals.push({
+      id: i, cx, cy, w: termW, h: termH,
+      color,
+      brightness: 0,
+      taskCount: 0,
+      // Terminal state
+      outputLines: [],        // currently visible lines
+      outputSet,              // template lines for this terminal
+      lineProgress: 0,        // which line we're revealing
+      charProgress: 0,        // char-by-char typing within a line
+      typing: false,          // whether actively showing output
+      typingSpeed: 0.12 + Math.random() * 0.06,
+      idlePrompt: true,       // show blinking cursor
+    });
+  }
+}
+layoutTerminals();
+
+// ── Particles ──
+const particles = [];
+const burstParticles = [];
+let nextSpawnTime = 0;
+let promptIdx = 0;
+
+class TaskParticle {
+  constructor(prompt) {
+    this.prompt = prompt;
+    this.phase = 'fall'; // fall -> route -> land
+    this.t = 0;
+    this.speed = 1.0 + Math.random() * 0.5;
+    this.x = W / 2 + (Math.random() - 0.5) * 160;
+    this.y = -10;
+    this.startX = this.x;
+    this.color = C.accent;
+    this.target = null;
+    this.routeX = 0;
+    this.routeY = 0;
+    this.alpha = 1;
+    this.size = 6;
+    this.done = false;
+    this.trail = [];
+  }
+
+  update(dt) {
+    if (this.phase === 'fall') {
+      this.t += dt * this.speed * 0.014;
+      const p = easeOut(Math.min(this.t, 1));
+      this.y = lerp(-10, routerCY, p);
+      this.x = this.startX + Math.sin(this.t * 4) * 6;
+      if (this.t >= 1) {
+        this.phase = 'route';
+        this.t = 0;
+        // Pick target terminal (clustered)
+        const cluster = Math.floor(Math.random() * 6);
+        const base = cluster * 6;
+        this.target = terminals[Math.min(base + Math.floor(Math.random() * 6), terminals.length - 1)];
+        this.color = this.target.color;
+        this.routeX = this.x;
+        this.routeY = this.y;
+      }
+    } else if (this.phase === 'route') {
+      this.t += dt * this.speed * 0.011;
+      const p = easeInOut(Math.min(this.t, 1));
+      const tx = this.target.cx;
+      const ty = this.target.cy;
+      const midY = (this.routeY + ty) * 0.5 - 30;
+      this.x = cubicBez(this.routeX, this.routeX, tx, tx, p);
+      this.y = cubicBez(this.routeY, midY, midY, ty, p);
+      if (this.t >= 1) {
+        this.phase = 'land';
+        this.t = 0;
+        // Trigger terminal activity
+        const term = this.target;
+        term.brightness = 1;
+        term.taskCount++;
+        term.typing = true;
+        term.lineProgress = 0;
+        term.charProgress = 0;
+        term.outputLines = [];
+        term.idlePrompt = false;
+        // Burst particles
+        for (let i = 0; i < 12; i++) {
+          const angle = (Math.PI * 2 * i) / 12;
+          const spd = 1.5 + Math.random() * 2;
+          burstParticles.push({
+            x: tx, y: ty,
+            vx: Math.cos(angle) * spd,
+            vy: Math.sin(angle) * spd,
+            life: 1, color: this.color,
+            size: 1.5 + Math.random() * 2,
+          });
+        }
+      }
+    } else {
+      this.t += dt * 0.05;
+      this.alpha = 1 - this.t;
+      this.size = 6 + this.t * 10;
+      if (this.t >= 1) this.done = true;
+    }
+
+    // Trail
+    if (this.phase !== 'land') {
+      this.trail.push({ x: this.x, y: this.y, a: 0.6 });
+    }
+    for (const t of this.trail) t.a -= dt * 0.03;
+    this.trail = this.trail.filter(t => t.a > 0);
+  }
+
+  draw() {
+    // Trail
+    for (const t of this.trail) {
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = rgba(this.color, t.a * 0.35);
+      ctx.fill();
+    }
+    if (this.done) return;
+
+    // Glow
+    const g = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, this.size + 10);
+    g.addColorStop(0, rgba(this.color, this.alpha * 0.3));
+    g.addColorStop(1, 'transparent');
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size + 10, 0, Math.PI * 2);
+    ctx.fillStyle = g;
+    ctx.fill();
+
+    // Core dot
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+    ctx.fillStyle = rgba(this.color, this.alpha * 0.9);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * 0.45, 0, Math.PI * 2);
+    ctx.fillStyle = rgba('#ffffff', this.alpha * 0.5);
+    ctx.fill();
+  }
+}
+
+// ── Draw: Background ──
+function drawBg() {
+  ctx.fillStyle = C.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle radial gradient center glow
+  const g = ctx.createRadialGradient(W/2, routerCY, 0, W/2, routerCY, W * 0.5);
+  g.addColorStop(0, 'rgba(240,192,64,0.02)');
+  g.addColorStop(1, 'transparent');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ── Draw: Router hub ──
+function drawRouter(time) {
+  const cx = W / 2, cy = routerCY, r = 26;
+  const pulse = Math.sin(time * 0.003) * 0.15;
+
+  // Glow ring
+  const g = ctx.createRadialGradient(cx, cy, r - 2, cx, cy, r + 50);
+  g.addColorStop(0, rgba(C.accent, 0.06 + pulse * 0.03));
+  g.addColorStop(1, 'transparent');
+  ctx.beginPath();
+  ctx.arc(cx, cy, r + 50, 0, Math.PI * 2);
+  ctx.fillStyle = g;
+  ctx.fill();
+
+  // Spinning ring segments
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(time * 0.001);
+  for (let i = 0; i < 3; i++) {
+    const a = (Math.PI * 2 / 3) * i;
+    ctx.beginPath();
+    ctx.arc(0, 0, r, a, a + 1.2);
+    ctx.strokeStyle = rgba(C.accent, 0.45);
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // Inner fill
+  ctx.beginPath();
+  ctx.arc(cx, cy, r - 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#111119';
+  ctx.fill();
+
+  // Router icon (diamond)
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(Math.PI / 4);
+  ctx.beginPath();
+  rRect(ctx, -8, -8, 16, 16, 3);
+  ctx.strokeStyle = C.accent;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+
+  // Label
+  ctx.font = '800 13px Inter';
+  ctx.fillStyle = C.accent;
+  ctx.textAlign = 'center';
+  ctx.fillText('ROUTER', cx, cy + r + 20);
+}
+
+// ── Draw: Connection lines ──
+function drawConnections() {
+  const cx = W / 2, cy = routerCY;
+  for (const t of terminals) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 26);
+    const midY = (cy + 26 + t.cy - t.h / 2) * 0.5;
+    ctx.quadraticCurveTo((cx + t.cx) / 2, midY, t.cx, t.cy - t.h / 2);
+    ctx.strokeStyle = rgba(t.color, 0.025 + t.brightness * 0.08);
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+}
+
+// ── Draw: Terminal sessions ──
+function drawTerminals(time, dt) {
+  for (const t of terminals) {
+    t.brightness *= 0.985;
+
+    const x = t.cx - t.w / 2;
+    const y = t.cy - t.h / 2;
+    const bright = t.brightness;
+    const barH = 16;
+
+    // ─ Terminal shadow/glow ─
+    if (bright > 0.05) {
+      ctx.shadowColor = t.color;
+      ctx.shadowBlur = bright * 25;
+    }
+
+    // ─ Terminal body ─
+    ctx.beginPath();
+    rRect(ctx, x, y, t.w, t.h, 5);
+    ctx.fillStyle = bright > 0.05
+      ? lerpColor(C.termBg, t.color, bright * 0.06)
+      : C.termBg;
+    ctx.fill();
+    ctx.strokeStyle = rgba(t.color, 0.1 + bright * 0.5);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.shadowColor = 'transparent';
+    ctx.shadowBlur = 0;
+
+    // ─ Title bar ─
+    ctx.beginPath();
+    rRectTop(ctx, x, y, t.w, barH, 5);
+    ctx.fillStyle = bright > 0.05
+      ? lerpColor(C.termBar, t.color, bright * 0.12)
+      : C.termBar;
+    ctx.fill();
+
+    // Title bar dots
+    const dotY = y + barH / 2;
+    for (let d = 0; d < 3; d++) {
+      ctx.beginPath();
+      ctx.arc(x + 8 + d * 9, dotY, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = d === 0 ? rgba(C.red, 0.6) : d === 1 ? rgba(C.accent, 0.5) : rgba(C.green, 0.5);
+      ctx.fill();
+    }
+
+    // Title text
+    ctx.font = '600 8px "JetBrains Mono"';
+    ctx.fillStyle = rgba(t.color, 0.5 + bright * 0.5);
+    ctx.textAlign = 'right';
+    ctx.fillText(`codex`, x + t.w - 7, dotY + 3);
+
+    // ─ Terminal content area ─
+    const contentX = x + 6;
+    const contentY = y + barH + 4;
+    const lineH = 9;
+    const maxVisibleLines = Math.floor((t.h - barH - 8) / lineH);
+
+    // Update typing simulation
+    if (t.typing && t.lineProgress < t.outputSet.length) {
+      t.charProgress += dt * t.typingSpeed;
+      const currentLine = t.outputSet[t.lineProgress];
+      if (t.charProgress >= currentLine.length) {
+        // Line complete
+        t.outputLines.push(currentLine);
+        t.lineProgress++;
+        t.charProgress = 0;
+        if (t.lineProgress >= t.outputSet.length) {
+          t.typing = false;
+          t.idlePrompt = true;
+        }
+      }
+    }
+
+    // Draw output lines
+    ctx.textAlign = 'left';
+    ctx.font = '500 7px "JetBrains Mono"';
+
+    const visibleLines = t.outputLines.slice(-maxVisibleLines);
+    const startIdx = Math.max(0, visibleLines.length - maxVisibleLines);
+
+    for (let li = 0; li < visibleLines.length && li < maxVisibleLines; li++) {
+      const line = visibleLines[li];
+      const ly = contentY + li * lineH + lineH;
+      // Color the $ line differently
+      if (line.startsWith('$')) {
+        ctx.fillStyle = rgba(t.color, 0.8 + bright * 0.2);
+      } else if (line.startsWith('>')) {
+        ctx.fillStyle = rgba(C.text, 0.35 + bright * 0.2);
+      } else {
+        ctx.fillStyle = rgba(C.dim, 0.5);
+      }
+      const clipped = line.length > 24 ? line.slice(0, 24) + '...' : line;
+      ctx.fillText(clipped, contentX, ly);
+    }
+
+    // Currently typing line
+    if (t.typing && t.lineProgress < t.outputSet.length) {
+      const currentFull = t.outputSet[t.lineProgress];
+      const shown = currentFull.slice(0, Math.floor(t.charProgress));
+      const ly = contentY + Math.min(visibleLines.length, maxVisibleLines - 1) * lineH + lineH;
+      if (shown.startsWith('$')) {
+        ctx.fillStyle = rgba(t.color, 0.9);
+      } else {
+        ctx.fillStyle = rgba(C.text, 0.5);
+      }
+      const clipped = shown.length > 24 ? shown.slice(0, 24) + '...' : shown;
+      ctx.fillText(clipped, contentX, ly);
+
+      // Typing cursor
+      const cursorX = contentX + ctx.measureText(clipped).width + 1;
+      if (Math.floor(time / 400) % 2 === 0) {
+        ctx.fillStyle = rgba(t.color, 0.8);
+        ctx.fillRect(cursorX, ly - 6, 4, 7);
+      }
+    }
+
+    // Idle blinking cursor
+    if (t.idlePrompt && !t.typing) {
+      const idxY = contentY + Math.min(t.outputLines.length, maxVisibleLines - 1) * lineH + lineH;
+      ctx.fillStyle = rgba(C.dim, 0.4);
+      ctx.fillText('$', contentX, idxY);
+      if (Math.floor(time / 600) % 2 === 0) {
+        ctx.fillStyle = rgba(t.color, 0.5);
+        ctx.fillRect(contentX + 8, idxY - 6, 4, 7);
+      }
+    }
+  }
+}
+
+// ── Draw: Header (minimal) ──
+function drawHeader(time) {
+  // Title
+  ctx.font = '900 32px Inter';
+  ctx.textAlign = 'center';
+
+  // Gradient text effect (draw twice for glow)
+  ctx.fillStyle = rgba(C.accent, 0.08);
+  ctx.fillText('LEOPARD GECKO', W / 2, 44);
+  ctx.fillStyle = '#e8e8f0';
+  ctx.fillText('LEOPARD GECKO', W / 2, 44);
+
+  // Subtitle
+  ctx.font = '600 12px "JetBrains Mono"';
+  ctx.fillStyle = rgba(C.dim, 0.6);
+  ctx.fillText('context-routing orchestrator', W / 2, 64);
+
+  // Prompt input bar
+  const barW = 480, barH = 40;
+  const barX = W / 2 - barW / 2, barY = 82;
+
+  ctx.beginPath();
+  rRect(ctx, barX, barY, barW, barH, 8);
+  ctx.fillStyle = '#0c0c16';
+  ctx.fill();
+  ctx.strokeStyle = rgba(C.accent, 0.15);
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Prompt prefix
+  ctx.font = '600 13px "JetBrains Mono"';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = rgba(C.accent, 0.5);
+  ctx.fillText('$', barX + 14, barY + 25);
+
+  // Typing prompt text
+  const currentPrompt = PROMPTS[promptIdx % PROMPTS.length];
+  const typeCycle = (time * 0.006) % (currentPrompt.length + 30);
+  const visibleChars = Math.min(Math.floor(typeCycle), currentPrompt.length);
+  const displayText = currentPrompt.slice(0, visibleChars);
+
+  ctx.fillStyle = C.text;
+  ctx.fillText(displayText, barX + 30, barY + 25);
+
+  // Cursor
+  if (Math.floor(time / 500) % 2 === 0) {
+    const cursorX = barX + 30 + ctx.measureText(displayText).width + 1;
+    ctx.fillStyle = C.accent;
+    ctx.fillRect(cursorX, barY + 13, 2, 16);
+  }
+
+  // Arrow down to router
+  const arrowTop = barY + barH + 6;
+  const arrowBot = routerCY - 32;
+  ctx.beginPath();
+  ctx.setLineDash([4, 6]);
+  ctx.moveTo(W / 2, arrowTop);
+  ctx.lineTo(W / 2, arrowBot);
+  ctx.strokeStyle = rgba(C.accent, 0.15);
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Arrowhead
+  ctx.beginPath();
+  ctx.moveTo(W / 2, arrowBot + 1);
+  ctx.lineTo(W / 2 - 4, arrowBot - 5);
+  ctx.lineTo(W / 2 + 4, arrowBot - 5);
+  ctx.closePath();
+  ctx.fillStyle = rgba(C.accent, 0.25);
+  ctx.fill();
+}
+
+// ── Burst particles ──
+function updateBurst(dt) {
+  for (const p of burstParticles) {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vx *= 0.94;
+    p.vy *= 0.94;
+    p.life -= dt * 0.025;
+  }
+  for (let i = burstParticles.length - 1; i >= 0; i--) {
+    if (burstParticles[i].life <= 0) burstParticles.splice(i, 1);
+  }
+}
+function drawBurst() {
+  for (const p of burstParticles) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fillStyle = rgba(p.color, p.life * 0.5);
+    ctx.fill();
+  }
+}
+
+// ── Main Loop ──
+let lastTime = 0;
+
+function loop(time) {
+  const dt = Math.min(time - lastTime, 50);
+  lastTime = time;
+
+  drawBg();
+  drawConnections();
+  drawHeader(time);
+  drawRouter(time);
+  drawTerminals(time, dt);
+
+  // Spawn particles
+  if (time > nextSpawnTime) {
+    const prompt = PROMPTS[promptIdx % PROMPTS.length];
+    particles.push(new TaskParticle(prompt));
+    promptIdx++;
+    nextSpawnTime = time + 700 + Math.random() * 900;
+  }
+
+  // Update & draw particles
+  for (const p of particles) { p.update(dt); p.draw(); }
+  for (let i = particles.length - 1; i >= 0; i--) {
+    if (particles[i].done) particles.splice(i, 1);
+  }
+
+  updateBurst(dt);
+  drawBurst();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ── Utilities ──
+function lerp(a, b, t) { return a + (b - a) * t; }
+function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
+function easeInOut(t) { return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; }
+function cubicBez(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  return u*u*u*p0 + 3*u*u*t*p1 + 3*u*t*t*p2 + t*t*t*p3;
+}
+
+function rgba(hex, a) {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${Math.max(0, Math.min(1, a))})`;
+}
+
+function lerpColor(h1, h2, t) {
+  const r1 = parseInt(h1.slice(1,3),16), g1 = parseInt(h1.slice(3,5),16), b1 = parseInt(h1.slice(5,7),16);
+  const r2 = parseInt(h2.slice(1,3),16), g2 = parseInt(h2.slice(3,5),16), b2 = parseInt(h2.slice(5,7),16);
+  return `rgb(${Math.round(lerp(r1,r2,t))},${Math.round(lerp(g1,g2,t))},${Math.round(lerp(b1,b2,t))})`;
+}
+
+function rRect(ctx, x, y, w, h, r) {
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function rRectTop(ctx, x, y, w, h, r) {
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+</script>
+</body>
+</html>

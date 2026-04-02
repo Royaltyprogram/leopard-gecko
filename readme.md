@@ -1,8 +1,13 @@
-# Leopard Gecko
+<p align="center">
+  <img src="assets/logo.PNG" alt="Leopard Gecko" width="400" />
+</p>
 
-**The First Context Engineer That Replaces You.**
+<h1 align="center">Leopard Gecko</h1>
 
-코딩 에이전트 세션을 자동으로 라우팅하고 관리하는 컨텍스트 오케스트레이터.
+<p align="center">
+  <strong>The First Context Engineer That Replaces You.</strong><br/>
+  코딩 에이전트 세션을 자동으로 라우팅하고 관리하는 컨텍스트 오케스트레이터.
+</p>
 
 ---
 
